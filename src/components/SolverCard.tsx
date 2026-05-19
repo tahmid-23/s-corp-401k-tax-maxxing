@@ -32,16 +32,17 @@ export function SolverCard({ solution }: { solution: Solution }) {
       <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-warn mb-2">
         Out of reach
       </div>
-      <p className="text-sm leading-relaxed text-ink-soft mb-2">
+      <p className="text-sm leading-relaxed text-ink-soft mb-3">
         {solution.reason}
       </p>
-      <p className="text-sm text-ink-soft">
-        The most you could hit with your current inputs is{" "}
-        <span className="font-mono text-ink">
+      <div className="text-sm">
+        <span className="text-[10px] uppercase tracking-[0.14em] text-ink-faint">
+          Max reachable
+        </span>
+        <span className="ml-2 font-mono tabular-nums text-ink">
           {money(solution.maximumAchievable)}
         </span>
-        .
-      </p>
+      </div>
     </div>
   );
 }

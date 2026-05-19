@@ -341,6 +341,45 @@ describe("Solver", () => {
     }
   });
 
+  it("infeasibility message uses profit ceiling when profit binds tighter than 415(c)", () => {
+    // Target $80k, profit only $100k. At $100k W-2, achievable is
+    // min(24500, postFica(100k)) + 25000 = 24500 + 25000 = 49500 < $72k cap.
+    // So profit binds, not 415(c).
+    const result = solveForTarget(
+      {
+        ...baseInputs,
+        dayJobW2: 0,
+        dayJob401kEmployeeContribution: 0,
+        sCorpNetProfit: 100_000,
+      },
+      80_000,
+    );
+    expect(result.feasible).toBe(false);
+    if (!result.feasible) {
+      expect(result.reason).toMatch(/net profit/i);
+      expect(result.reason).not.toMatch(/Solo 401\(k\) plan caps out/i);
+      expect(result.maximumAchievable).toBeCloseTo(49_500, -1);
+    }
+  });
+
+  it("infeasibility message uses 415(c) when profit allows it but target is above $72k", () => {
+    // Plenty of profit, but target is $80k > 415(c) cap of $72k
+    const result = solveForTarget(
+      {
+        ...baseInputs,
+        dayJobW2: 0,
+        dayJob401kEmployeeContribution: 0,
+        sCorpNetProfit: 1_000_000,
+      },
+      80_000,
+    );
+    expect(result.feasible).toBe(false);
+    if (!result.feasible) {
+      expect(result.reason).toMatch(/Solo 401\(k\) plan caps out/i);
+      expect(result.maximumAchievable).toBeCloseTo(72_000, -1);
+    }
+  });
+
   it("closed-form: target $50k with full 402(g) room → W = $102,000 (Regime B)", () => {
     // Beyond crossover. D saturates at 24,500, E = 25,500, W = 4 × 25,500.
     const result = solveForTarget(

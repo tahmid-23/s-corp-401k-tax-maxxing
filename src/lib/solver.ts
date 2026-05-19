@@ -152,29 +152,41 @@ export function solveForTarget(
     effectiveDeferralLimit - dayJobEmployeeDeferral,
   );
 
+  // What's the true ceiling given this user's inputs? It's the lesser of:
+  //   - the 415(c) cap ($72k), which is a federal limit
+  //   - what their S-corp profit can actually deliver (capped W-2)
+  const profitCeiling = achievableAtW(inputs.sCorpNetProfit, deferralRoom);
+  const trueCeiling = Math.min(
+    FEDERAL.annualAdditions415c,
+    profitCeiling,
+  );
+  const profitBinds = profitCeiling < FEDERAL.annualAdditions415c;
+
   const sub = solveMinSCorpW2({
     target: targetAfterDayJob,
     deferralRoom,
   });
 
-  if (!sub.feasible) {
-    return {
-      feasible: false,
-      reason: `One Solo 401(k) plan caps out at $${formatNumber(FEDERAL.annualAdditions415c)} in total contributions per year, and your target is above that. You'd need a second unrelated employer's 401(k) to go higher.`,
-      maximumAchievable:
-        dayJobEmployeeDeferral + dayJobMatch + sub.maxAchievable,
-    };
-  }
+  // If the solver itself says it's infeasible, the target is above 415(c).
+  // If the solver returned a feasible W-2 but it exceeds the user's profit,
+  // the profit ceiling is binding even though 415(c) wouldn't be.
+  const infeasibleAt415c = !sub.feasible;
+  const infeasibleAtProfit = sub.feasible && sub.w2 > inputs.sCorpNetProfit;
 
-  // Reject if the recommended W-2 exceeds what the S-corp can actually pay.
-  if (sub.w2 > inputs.sCorpNetProfit) {
+  if (infeasibleAt415c || infeasibleAtProfit) {
+    const maximumAchievable =
+      dayJobEmployeeDeferral + dayJobMatch + trueCeiling;
+
+    // Use the binding-constraint message: profit if that's the lower wall,
+    // 415(c) otherwise.
+    const reason = profitBinds
+      ? `Your S-corp's net profit of $${formatNumber(inputs.sCorpNetProfit)} caps the W-2 you can pay yourself, which in turn caps the Solo 401(k) at $${formatNumber(profitCeiling)}. The business needs more profit to reach this target.`
+      : `One Solo 401(k) plan caps out at $${formatNumber(FEDERAL.annualAdditions415c)} in total contributions per year, and your target is above that. You'd need a second unrelated employer's 401(k) to go higher.`;
+
     return {
       feasible: false,
-      reason: `Your S-corp would need to pay you $${formatNumber(sub.w2)} in W-2 wages to hit this target, but it only earns $${formatNumber(inputs.sCorpNetProfit)} in net profit. The business isn't earning enough to support this contribution level.`,
-      maximumAchievable:
-        dayJobEmployeeDeferral +
-        dayJobMatch +
-        achievableAtW(inputs.sCorpNetProfit, deferralRoom),
+      reason,
+      maximumAchievable,
     };
   }
 
