@@ -3,11 +3,14 @@ import type { Inputs } from "./calc";
 import { formatNumber } from "./format";
 
 /**
- * The maximum employee 401(k) deferral that can actually be taken out of a
- * given W-2. The IRS limit is 100% of compensation (gross), but you can't
- * defer more cash than your paycheck delivers, and FICA is withheld before
- * the deferral comes out. So the practical ceiling is W-2 minus employee SS
- * (6.2% up to the wage base) and Medicare (1.45% with no cap).
+ * Post-FICA cash from a given S-corp W-2. The IRS limit on elective deferral
+ * is 100% of compensation (gross), but FICA is withheld before the deferral
+ * comes out of the paycheck. So the practical ceiling on the deferral is
+ *   W minus employee SS (6.2% up to the wage base)
+ *     minus employee Medicare (1.45%, no cap).
+ *
+ * Below the SS wage base:  postFica(W) = 0.9235 · W
+ * Above it:                postFica(W) = 0.9855 · W − 0.062 · ssWageBase
  */
 function postFicaDeferralCap(w2: number): number {
   if (w2 <= 0) return 0;
@@ -34,15 +37,78 @@ export type Solution =
     };
 
 /**
- * Given inputs, find the minimum S-corp W-2 that hits `target401kTotal`.
+ * Closed-form solver for the minimum S-corp W-2 that delivers a given amount
+ * `T` of Solo 401(k) contribution, given remaining 402(g) deferral room `R`
+ * and the 415(c) annual-additions cap.
  *
- * Strategy: max out the day-job employee deferral first (to capture match),
- * spill the remaining elective deferral room into the solo 401(k), then
- * compute the S-corp W-2 needed for the residual to come from employer
- * profit-sharing at 25% of W-2 (subject to 415(c)).
+ * Achievable contribution at W:
+ *   G(W) = min(R, postFica(W)) + 0.25·W,  bounded by 415(c).
  *
- * Day-job employee deferral is taken from the input (the user already chose it
- * in the form) unless that choice violates limits.
+ * Two regimes:
+ *
+ *   Regime A — W-2-limited deferral.   postFica(W) < R, so D = postFica(W).
+ *     Below SS wage base:  G(W) = 1.1735·W    →  W = T / 1.1735
+ *     Above SS wage base:  G(W) = 1.2355·W − 11439  →  W = (T + 11439) / 1.2355
+ *
+ *   Regime B — 402(g)-limited deferral.  postFica(W) ≥ R, so D = R.
+ *     G(W) = R + 0.25·W  →  W = 4·(T − R)
+ *
+ * The regimes meet continuously at W_R, the smallest wage where
+ * postFica(W_R) = R.
+ */
+function solveMinSCorpW2(args: {
+  target: number;
+  deferralRoom: number;
+}):
+  | { feasible: true; w2: number; deferral: number; employer: number }
+  | { feasible: false; maxAchievable: number } {
+  const T = args.target;
+  const R = Math.max(0, args.deferralRoom);
+  const C415 = FEDERAL.annualAdditions415c;
+  const ssBase = FEDERAL.ssWageBase;
+  const ssRate = FEDERAL.ssRateEmployee;
+  const medRate = FEDERAL.medicareRateEmployee;
+  const ficaLow = 1 - ssRate - medRate; // 0.9235
+  const ficaHigh = 1 - medRate; // 0.9855
+  const ssMaxEmp = ssRate * ssBase; // 11_439 (2026)
+  const erRate = FEDERAL.employerContribPctOfW2; // 0.25
+
+  if (T <= 0) return { feasible: true, w2: 0, deferral: 0, employer: 0 };
+  if (T > C415) return { feasible: false, maxAchievable: C415 };
+
+  // W_R: smallest W where postFica(W) ≥ R. Below the wage base the function
+  // is 0.9235·W; above it kinks to 0.9855·W − 11439.
+  const wR =
+    R <= ficaLow * ssBase ? R / ficaLow : (R + ssMaxEmp) / ficaHigh;
+  const gR = R + erRate * wR; // achievable D+E at W = W_R
+
+  let w: number;
+  if (T <= gR) {
+    // Regime A: try the low-wage piece first.
+    const wLow = T / (ficaLow + erRate); // T / 1.1735
+    w = wLow <= ssBase ? wLow : (T + ssMaxEmp) / (ficaHigh + erRate);
+  } else {
+    // Regime B: deferral saturates at R, employer side fills the rest.
+    w = (T - R) / erRate; // 4 · (T − R)
+  }
+
+  const d = Math.min(R, postFicaDeferralCap(w));
+  const e = Math.max(0, T - d);
+
+  return { feasible: true, w2: w, deferral: d, employer: e };
+}
+
+/**
+ * Given inputs, find the minimum S-corp W-2 that hits `target`.
+ *
+ * Strategy:
+ *   1. Take day-job contributions as given (employee deferral chosen by the
+ *      user, employer match implied by the match terms).
+ *   2. Subtract those from the target to get the residual that must come
+ *      from the S-corp Solo 401(k).
+ *   3. Solve for the minimum S-corp W-2 that supports that residual, given
+ *      remaining 402(g) room, the post-FICA cash cap, the 25% employer rule,
+ *      and the per-employer 415(c) cap.
  */
 export function solveForTarget(
   inputs: Inputs,
@@ -68,19 +134,6 @@ export function solveForTarget(
   const dayJobMatchedBase = Math.min(dayJobEmployeeDeferral, dayJobMatchCap);
   const dayJobMatch = dayJobMatchedBase * inputs.dayJobMatchPct;
 
-  // Remaining elective deferral room goes to solo 401(k) employee deferral,
-  // bounded by (a) the per-person 402(g) cap minus day-job use, (b) the
-  // plan's own 415(c) total, and (c) the post-FICA cash actually deliverable
-  // from your S-corp W-2.
-  const soloEmployeeDeferralCapacity = Math.max(
-    0,
-    Math.min(
-      effectiveDeferralLimit - dayJobEmployeeDeferral,
-      FEDERAL.annualAdditions415c,
-      postFicaDeferralCap(inputs.sCorpW2Salary),
-    ),
-  );
-
   const targetAfterDayJob = target - dayJobEmployeeDeferral - dayJobMatch;
   if (targetAfterDayJob <= 0) {
     return {
@@ -94,63 +147,56 @@ export function solveForTarget(
     };
   }
 
-  // Allocate as much as possible to solo employee deferral (no W-2 cost)
-  const soloEmployeeDeferral = Math.min(
-    targetAfterDayJob,
-    soloEmployeeDeferralCapacity,
+  const deferralRoom = Math.max(
+    0,
+    effectiveDeferralLimit - dayJobEmployeeDeferral,
   );
-  const remaining = targetAfterDayJob - soloEmployeeDeferral;
 
-  if (remaining <= 0) {
-    return {
-      feasible: true,
-      sCorpW2: inputs.sCorpW2Salary, // unchanged; W-2 not needed
-      soloEmployeeDeferral,
-      soloEmployerContribution: 0,
-      dayJobEmployeeDeferral,
-      total: dayJobEmployeeDeferral + dayJobMatch + soloEmployeeDeferral,
-      note: "No S-corp W-2 increase needed. Additional employee deferrals at the Solo 401(k) cover the target.",
-    };
-  }
+  const sub = solveMinSCorpW2({
+    target: targetAfterDayJob,
+    deferralRoom,
+  });
 
-  // Remaining must come from solo employer side: ≤ 25% × W-2 AND
-  // ≤ 415(c) − soloEmployeeDeferral.
-  const employer415cRoom = FEDERAL.annualAdditions415c - soloEmployeeDeferral;
-  if (remaining > employer415cRoom) {
+  if (!sub.feasible) {
     return {
       feasible: false,
       reason: `One Solo 401(k) plan caps out at $${formatNumber(FEDERAL.annualAdditions415c)} in total contributions per year, and your target is above that. You'd need a second unrelated employer's 401(k) to go higher.`,
       maximumAchievable:
-        dayJobEmployeeDeferral +
-        dayJobMatch +
-        soloEmployeeDeferral +
-        employer415cRoom,
+        dayJobEmployeeDeferral + dayJobMatch + sub.maxAchievable,
     };
   }
 
-  const requiredSCorpW2 = remaining / FEDERAL.employerContribPctOfW2;
-
-  // Sanity: if the user's S-corp net profit cannot support that W-2, flag it.
-  if (requiredSCorpW2 > inputs.sCorpNetProfit) {
+  // Reject if the recommended W-2 exceeds what the S-corp can actually pay.
+  if (sub.w2 > inputs.sCorpNetProfit) {
     return {
       feasible: false,
-      reason: `Your S-corp would need to pay you $${formatNumber(requiredSCorpW2)} in W-2 wages to hit this target, but it only earns $${formatNumber(inputs.sCorpNetProfit)} in net profit. The business isn't earning enough to support this contribution level.`,
+      reason: `Your S-corp would need to pay you $${formatNumber(sub.w2)} in W-2 wages to hit this target, but it only earns $${formatNumber(inputs.sCorpNetProfit)} in net profit. The business isn't earning enough to support this contribution level.`,
       maximumAchievable:
         dayJobEmployeeDeferral +
         dayJobMatch +
-        soloEmployeeDeferral +
-        inputs.sCorpNetProfit * FEDERAL.employerContribPctOfW2,
+        achievableAtW(inputs.sCorpNetProfit, deferralRoom),
     };
   }
 
   return {
     feasible: true,
-    sCorpW2: requiredSCorpW2,
-    soloEmployeeDeferral,
-    soloEmployerContribution: remaining,
+    sCorpW2: sub.w2,
+    soloEmployeeDeferral: sub.deferral,
+    soloEmployerContribution: sub.employer,
     dayJobEmployeeDeferral,
-    total:
-      dayJobEmployeeDeferral + dayJobMatch + soloEmployeeDeferral + remaining,
-    note: `Set S-corp W-2 to $${formatNumber(requiredSCorpW2)}. Contribute $${formatNumber(soloEmployeeDeferral)} as employee deferral and $${formatNumber(remaining)} as employer profit-sharing at the Solo 401(k).`,
+    total: dayJobEmployeeDeferral + dayJobMatch + sub.deferral + sub.employer,
+    note:
+      sub.w2 <= inputs.sCorpW2Salary
+        ? `Your current S-corp W-2 of $${formatNumber(inputs.sCorpW2Salary)} is already enough. Contribute $${formatNumber(sub.deferral)} as employee deferral and $${formatNumber(sub.employer)} as employer profit-sharing at the Solo 401(k).`
+        : `Set S-corp W-2 to $${formatNumber(sub.w2)}. Contribute $${formatNumber(sub.deferral)} as employee deferral and $${formatNumber(sub.employer)} as employer profit-sharing at the Solo 401(k).`,
   };
+}
+
+/** What's the maximum Solo contribution achievable at a given W-2? */
+function achievableAtW(w: number, deferralRoom: number): number {
+  return Math.min(
+    FEDERAL.annualAdditions415c,
+    Math.min(deferralRoom, postFicaDeferralCap(w)) +
+      FEDERAL.employerContribPctOfW2 * w,
+  );
 }

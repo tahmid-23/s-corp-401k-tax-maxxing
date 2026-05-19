@@ -314,6 +314,51 @@ describe("Solver", () => {
       expect(result.soloEmployeeDeferral).toBeLessThanOrEqual(22_164 + 1);
     }
   });
+
+  it("closed-form: target $24,500 with full 402(g) room → W ≈ $20,878", () => {
+    // Regime A. W = T / 1.1735.
+    const result = solveForTarget(
+      {
+        ...baseInputs,
+        dayJobW2: 0,
+        dayJob401kEmployeeContribution: 0,
+        sCorpNetProfit: 500_000,
+      },
+      24_500,
+    );
+    expect(result.feasible).toBe(true);
+    if (result.feasible) {
+      expect(result.sCorpW2).toBeCloseTo(20_878, -1); // within $10
+      expect(result.soloEmployeeDeferral).toBeCloseTo(19_281, -1);
+      expect(result.soloEmployerContribution).toBeCloseTo(5_219, -1);
+      // Sanity: employee deferral fits within post-FICA cash from this W-2
+      const postFica = result.sCorpW2 * (1 - 0.062 - 0.0145);
+      expect(result.soloEmployeeDeferral).toBeLessThanOrEqual(postFica + 1);
+      // Employer side fits within 25% of W-2
+      expect(result.soloEmployerContribution).toBeLessThanOrEqual(
+        result.sCorpW2 * 0.25 + 1,
+      );
+    }
+  });
+
+  it("closed-form: target $50k with full 402(g) room → W = $102,000 (Regime B)", () => {
+    // Beyond crossover. D saturates at 24,500, E = 25,500, W = 4 × 25,500.
+    const result = solveForTarget(
+      {
+        ...baseInputs,
+        dayJobW2: 0,
+        dayJob401kEmployeeContribution: 0,
+        sCorpNetProfit: 500_000,
+      },
+      50_000,
+    );
+    expect(result.feasible).toBe(true);
+    if (result.feasible) {
+      expect(result.sCorpW2).toBeCloseTo(102_000, -1);
+      expect(result.soloEmployeeDeferral).toBeCloseTo(24_500, -1);
+      expect(result.soloEmployerContribution).toBeCloseTo(25_500, -1);
+    }
+  });
 });
 
 describe("Post-FICA deferral warning", () => {
