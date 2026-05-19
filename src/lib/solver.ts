@@ -165,6 +165,51 @@ function solveMinSCorpW2(args: {
  *      remaining 402(g) room, the post-FICA cash cap, the 25% employer rule,
  *      and the per-employer 415(c) cap.
  */
+/**
+ * The maximum total 401(k) contribution achievable given the user's inputs,
+ * combining day-job + Solo and respecting every constraint. Used to show
+ * the user their ceiling without making them play with the solver.
+ */
+export function maxAchievableContribution(inputs: Inputs): number {
+  const effectiveDeferralLimit =
+    inputs.age >= 60 && inputs.age <= 63
+      ? FEDERAL.elective402gLimit + FEDERAL.superCatchUp60to63
+      : inputs.age >= 50
+        ? FEDERAL.elective402gLimit + FEDERAL.catchUp50Plus
+        : FEDERAL.elective402gLimit;
+
+  // Day-job: match capture is the only mandatory contribution. Past that,
+  // extra deferrals are pure 402(g) consumption with no match earned (the
+  // match has already been captured at the matchable-comp cap).
+  const matchableComp = inputs.dayJobW2 * inputs.dayJobMatchLimitPct;
+  const dayJobMatchCapture = Math.min(matchableComp, effectiveDeferralLimit);
+  const matchEarned = dayJobMatchCapture * inputs.dayJobMatchPct;
+
+  // Max Solo at profit, given 402(g) room left after match capture
+  const roomAfterMatch = effectiveDeferralLimit - dayJobMatchCapture;
+  const soloMax = maxSoloAtProfit(inputs.sCorpNetProfit, roomAfterMatch);
+
+  // How much of soloMax is employee deferral? That uses 402(g) room.
+  // We can compute it by inverting: D = min(R, postFica(W*)) at W*.
+  const ssBase = FEDERAL.ssWageBase;
+  const erFicaLow = FEDERAL.ssRateEmployer + FEDERAL.medicareRateEmployer;
+  const erRate = FEDERAL.employerContribPctOfW2;
+  const wStar = Math.min(
+    inputs.sCorpNetProfit / (1 + erFicaLow + erRate),
+    ssBase,
+  );
+  const soloDeferral = Math.min(roomAfterMatch, postFicaDeferralCap(wStar));
+
+  // After the Solo eats its share of 402(g), how much can spill into the
+  // day-job? (No additional match — already maxed.)
+  const remainingDeferralRoom = Math.max(
+    0,
+    effectiveDeferralLimit - dayJobMatchCapture - soloDeferral,
+  );
+
+  return dayJobMatchCapture + matchEarned + soloMax + remainingDeferralRoom;
+}
+
 export function solveForTarget(
   inputs: Inputs,
   target: number,

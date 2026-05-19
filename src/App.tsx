@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { motion } from "motion/react";
 import { compute, type Inputs } from "./lib/calc";
-import { solveForTarget } from "./lib/solver";
+import { maxAchievableContribution, solveForTarget } from "./lib/solver";
 import {
   FEDERAL,
   STATES,
@@ -45,6 +45,10 @@ export function App() {
   const [target401k, setTarget401k] = useState<number | null>(null);
 
   const out = useMemo(() => compute(inputs), [inputs]);
+  const maxContribution = useMemo(
+    () => maxAchievableContribution(inputs),
+    [inputs],
+  );
   const solution = useMemo(
     () =>
       target401k != null && target401k > 0
@@ -335,6 +339,19 @@ export function App() {
                   step={5_000}
                 />
               </Field>
+              <div className="flex items-baseline justify-between text-sm pt-1">
+                <span className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">
+                  Max possible with these inputs
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setTarget401k(Math.round(maxContribution))}
+                  className="font-mono tabular-nums text-base text-accent underline decoration-accent/30 underline-offset-2 hover:decoration-accent transition-colors"
+                  title="Click to set target to this amount"
+                >
+                  {money(maxContribution)}
+                </button>
+              </div>
               <Field
                 label="Target 401(k) total (optional)"
                 hint="Enter a target and you'll see what salary and split would get you there."
