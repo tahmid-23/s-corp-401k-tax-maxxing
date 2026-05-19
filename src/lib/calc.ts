@@ -331,6 +331,22 @@ export function compute(inputs: Inputs): Output {
       `Solo 401(k) total annual additions exceed the 415(c) limit of $${formatNumber(FEDERAL.annualAdditions415c)}.`,
     );
   }
+  // Solo employee deferral can't exceed post-FICA W-2 cash.
+  if (inputs.sCorpW2Salary > 0 && soloEmployeeDeferral > 0) {
+    const ssTaxable = Math.min(inputs.sCorpW2Salary, FEDERAL.ssWageBase);
+    const ssWithheld = ssTaxable * FEDERAL.ssRateEmployee;
+    const medicareWithheld =
+      inputs.sCorpW2Salary * FEDERAL.medicareRateEmployee;
+    const postFicaCash = Math.max(
+      0,
+      inputs.sCorpW2Salary - ssWithheld - medicareWithheld,
+    );
+    if (soloEmployeeDeferral > postFicaCash + 0.5) {
+      warnings.push(
+        `Solo employee deferral of $${formatNumber(soloEmployeeDeferral)} exceeds the post-FICA cash from your S-corp W-2 ($${formatNumber(postFicaCash)}). You can't defer more than your paycheck delivers.`,
+      );
+    }
+  }
 
   // ── 415(c) remaining ──────────────────────────────────────────────────────
   const dayJob415cRemaining = Math.max(

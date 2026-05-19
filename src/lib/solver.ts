@@ -2,6 +2,21 @@ import { FEDERAL } from "./tax-constants";
 import type { Inputs } from "./calc";
 import { formatNumber } from "./format";
 
+/**
+ * The maximum employee 401(k) deferral that can actually be taken out of a
+ * given W-2. The IRS limit is 100% of compensation (gross), but you can't
+ * defer more cash than your paycheck delivers, and FICA is withheld before
+ * the deferral comes out. So the practical ceiling is W-2 minus employee SS
+ * (6.2% up to the wage base) and Medicare (1.45% with no cap).
+ */
+function postFicaDeferralCap(w2: number): number {
+  if (w2 <= 0) return 0;
+  const ssTaxable = Math.min(w2, FEDERAL.ssWageBase);
+  const ss = ssTaxable * FEDERAL.ssRateEmployee;
+  const medicare = w2 * FEDERAL.medicareRateEmployee;
+  return Math.max(0, w2 - ss - medicare);
+}
+
 export type Solution =
   | {
       feasible: true;
@@ -53,12 +68,16 @@ export function solveForTarget(
   const dayJobMatchedBase = Math.min(dayJobEmployeeDeferral, dayJobMatchCap);
   const dayJobMatch = dayJobMatchedBase * inputs.dayJobMatchPct;
 
-  // Remaining elective deferral room goes to solo 401(k) employee deferral.
+  // Remaining elective deferral room goes to solo 401(k) employee deferral,
+  // bounded by (a) the per-person 402(g) cap minus day-job use, (b) the
+  // plan's own 415(c) total, and (c) the post-FICA cash actually deliverable
+  // from your S-corp W-2.
   const soloEmployeeDeferralCapacity = Math.max(
     0,
     Math.min(
       effectiveDeferralLimit - dayJobEmployeeDeferral,
-      FEDERAL.annualAdditions415c, // solo's own 415(c)
+      FEDERAL.annualAdditions415c,
+      postFicaDeferralCap(inputs.sCorpW2Salary),
     ),
   );
 

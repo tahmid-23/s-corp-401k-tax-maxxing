@@ -296,4 +296,44 @@ describe("Solver", () => {
     );
     expect(result.feasible).toBe(true);
   });
+
+  it("caps solo employee deferral by post-FICA W-2 cash", () => {
+    // W-2 of $24,000. Employee FICA = 7.65% × 24,000 = $1,836.
+    // Post-FICA cash = $22,164. Solver must not recommend deferring more.
+    const result = solveForTarget(
+      {
+        ...baseInputs,
+        dayJobW2: 0, // isolate the S-corp side
+        dayJob401kEmployeeContribution: 0,
+        sCorpNetProfit: 100_000,
+        sCorpW2Salary: 24_000,
+      },
+      24_500, // exactly the full 402(g) limit, but unreachable from $24k W-2
+    );
+    if (result.feasible) {
+      expect(result.soloEmployeeDeferral).toBeLessThanOrEqual(22_164 + 1);
+    }
+  });
+});
+
+describe("Post-FICA deferral warning", () => {
+  it("warns when solo employee deferral exceeds post-FICA W-2 cash", () => {
+    const r = compute({
+      ...baseInputs,
+      sCorpNetProfit: 100_000,
+      sCorpW2Salary: 24_000,
+      soloEmployeeDeferral: 24_000, // gross-equal but post-FICA only $22,164
+    });
+    expect(r.warnings.some((w) => /post-FICA/i.test(w))).toBe(true);
+  });
+
+  it("does not warn when deferral fits within post-FICA cash", () => {
+    const r = compute({
+      ...baseInputs,
+      sCorpNetProfit: 100_000,
+      sCorpW2Salary: 24_000,
+      soloEmployeeDeferral: 20_000,
+    });
+    expect(r.warnings.some((w) => /post-FICA/i.test(w))).toBe(false);
+  });
 });
