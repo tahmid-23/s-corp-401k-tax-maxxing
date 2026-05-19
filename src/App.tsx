@@ -270,15 +270,6 @@ export function App() {
                   />
                 </Field>
               </FieldRow>
-              <input
-                type="range"
-                min={0}
-                max={Math.max(inputs.sCorpNetProfit, 250_000)}
-                step={1_000}
-                value={inputs.sCorpW2Salary}
-                onChange={(e) => set("sCorpW2Salary", Number(e.target.value))}
-                aria-label="S-corp W-2 salary slider"
-              />
               <FieldRow>
                 <Field label="Solo 401(k): employee deferral">
                   <NumberInput
