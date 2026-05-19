@@ -4,7 +4,6 @@ import { compute, type Inputs } from "./lib/calc";
 import {
   maxAchievableContribution,
   taxOptimalForTarget,
-  wealthNeutralContribution,
 } from "./lib/solver";
 import {
   FEDERAL,
@@ -51,10 +50,6 @@ export function App() {
   const out = useMemo(() => compute(inputs), [inputs]);
   const maxContribution = useMemo(
     () => maxAchievableContribution(inputs),
-    [inputs],
-  );
-  const wealthNeutralMax = useMemo(
-    () => wealthNeutralContribution(inputs),
     [inputs],
   );
   const optimal = useMemo(
@@ -363,33 +358,20 @@ export function App() {
               <div className="flex items-baseline justify-between text-sm pt-1">
                 <div>
                   <div className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">
-                    Wealth-neutral max
+                    Absolute ceiling
                   </div>
                   <div className="text-[11px] text-ink-faint italic mt-0.5">
-                    Contributing up to this much costs no net wealth
+                    The most you could put into 401(k) given your inputs
                   </div>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setTarget401k(Math.floor(wealthNeutralMax))}
+                  onClick={() => setTarget401k(Math.floor(maxContribution))}
                   className="font-mono tabular-nums text-base text-accent underline decoration-accent/30 underline-offset-2 hover:decoration-accent transition-colors"
                   title="Set target to this amount"
                 >
-                  {money(Math.floor(wealthNeutralMax))}
-                </button>
-              </div>
-              <div className="flex items-baseline justify-between text-sm">
-                <div>
-                  <div className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">
-                    Absolute ceiling
-                  </div>
-                  <div className="text-[11px] text-ink-faint italic mt-0.5">
-                    What you could cram in if tax cost were no object
-                  </div>
-                </div>
-                <span className="font-mono tabular-nums text-base text-ink">
                   {money(Math.floor(maxContribution))}
-                </span>
+                </button>
               </div>
               {optimal && (
                 <TaxOptimalCard solution={optimal} onApply={applyOptimal} />
