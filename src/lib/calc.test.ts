@@ -342,9 +342,11 @@ describe("Solver", () => {
   });
 
   it("infeasibility message uses profit ceiling when profit binds tighter than 415(c)", () => {
-    // Target $80k, profit only $100k. At $100k W-2, achievable is
-    // min(24500, postFica(100k)) + 25000 = 24500 + 25000 = 49500 < $72k cap.
-    // So profit binds, not 415(c).
+    // Profit $100k → sweet-spot W* = 100000/1.3265 = $75,386. At that W:
+    //   postFica(W*) = 0.9235·75386 = $69,619
+    //   D = min(R=24500, 69619) = $24,500
+    //   E = 0.25·75386 = $18,847
+    //   max Solo = $43,347 < $72k cap. So profit binds.
     const result = solveForTarget(
       {
         ...baseInputs,
@@ -358,7 +360,8 @@ describe("Solver", () => {
     if (!result.feasible) {
       expect(result.reason).toMatch(/net profit/i);
       expect(result.reason).not.toMatch(/Solo 401\(k\) plan caps out/i);
-      expect(result.maximumAchievable).toBeCloseTo(49_500, -1);
+      // Within $100 of the closed-form expected value
+      expect(result.maximumAchievable).toBeCloseTo(43_347, -2);
     }
   });
 
@@ -383,8 +386,13 @@ describe("Solver", () => {
   });
 
   it("solver spills to day-job 401(k) when S-corp can't reach the target", () => {
-    // S-corp profit only $10k → small Solo contribution. But day-job has
-    // unused 402(g) room. Target $30k should be reachable by combining.
+    // S-corp profit only $10k. Sweet-spot W* = 10000/1.3265 = $7,538.
+    // Solo max ≈ 0.9235·7538 + 0.25·7538 = $6,960 + $1,884 = $8,845.
+    // Day-job match capture: defer $6k → $3k match.
+    // Solo eats $6,960 of 402(g); day-job already used $6k. Spill room
+    // remaining = 24500 - 6000 - 6960 = $11,540.
+    // Max reachable = 6k + 3k + 8,845 + 11,540 ≈ $29,385.
+    // Target $20k should be reachable with day-job spill.
     const result = solveForTarget(
       {
         ...baseInputs,
@@ -394,14 +402,110 @@ describe("Solver", () => {
         dayJobMatchLimitPct: 0.06,
         sCorpNetProfit: 10_000,
       },
-      30_000,
+      20_000,
     );
     expect(result.feasible).toBe(true);
     if (result.feasible) {
       // Should defer more than just the match-capture at the day job
       expect(result.dayJobEmployeeDeferral).toBeGreaterThan(6_000);
-      // Total should hit the target
-      expect(result.total).toBeGreaterThanOrEqual(29_999);
+      expect(result.total).toBeGreaterThanOrEqual(19_999);
+    }
+  });
+
+  // Property-based: sweep a grid of inputs and check every feasible
+  // recommendation respects every constraint. If you regress any of these,
+  // this test catches it before the user does.
+  it("invariants: feasible recommendations always respect every constraint", () => {
+    const ssBase = 184_500;
+    const ssRate = 0.062;
+    const medRate = 0.0145;
+    const elective402g = 24_500;
+    const annual415c = 72_000;
+
+    const grid: { dayJobW2: number; profit: number; target: number }[] = [];
+    for (const dayJobW2 of [0, 50_000, 150_000, 250_000]) {
+      for (const profit of [10_000, 50_000, 150_000, 500_000]) {
+        for (const target of [
+          5_000, 10_000, 24_000, 24_500, 30_000, 50_000, 70_000, 72_000,
+        ]) {
+          grid.push({ dayJobW2, profit, target });
+        }
+      }
+    }
+
+    const violations: string[] = [];
+
+    for (const { dayJobW2, profit, target } of grid) {
+      const inputs = {
+        ...baseInputs,
+        dayJobW2,
+        dayJob401kEmployeeContribution: 0,
+        dayJobMatchPct: 0.5,
+        dayJobMatchLimitPct: 0.06,
+        sCorpNetProfit: profit,
+      };
+      const result = solveForTarget(inputs, target);
+      if (!result.feasible) continue;
+
+      const tag = `(dayJob=$${dayJobW2}, profit=$${profit}, target=$${target})`;
+
+      // 1. Total must reach the target (within $1 for rounding)
+      if (result.total < target - 1) {
+        violations.push(`${tag}: total $${result.total} < target $${target}`);
+      }
+
+      // 2. Combined employee deferral <= 402(g) limit
+      const combinedDeferral =
+        result.dayJobEmployeeDeferral + result.soloEmployeeDeferral;
+      if (combinedDeferral > elective402g + 1) {
+        violations.push(
+          `${tag}: combined deferral $${combinedDeferral} > 402(g) limit $${elective402g}`,
+        );
+      }
+
+      // 3. Solo employee deferral <= post-FICA cash from S-corp W-2
+      const ssTaxable = Math.min(result.sCorpW2, ssBase);
+      const postFica =
+        result.sCorpW2 - ssTaxable * ssRate - result.sCorpW2 * medRate;
+      if (result.soloEmployeeDeferral > postFica + 1) {
+        violations.push(
+          `${tag}: solo employee deferral $${result.soloEmployeeDeferral} > post-FICA cash $${postFica}`,
+        );
+      }
+
+      // 4. Solo employer contribution <= 25% of S-corp W-2
+      if (result.soloEmployerContribution > result.sCorpW2 * 0.25 + 1) {
+        violations.push(
+          `${tag}: employer contribution $${result.soloEmployerContribution} > 25% of W-2 ($${result.sCorpW2 * 0.25})`,
+        );
+      }
+
+      // 5. Solo total (employee + employer) <= 415(c)
+      const soloTotal =
+        result.soloEmployeeDeferral + result.soloEmployerContribution;
+      if (soloTotal > annual415c + 1) {
+        violations.push(
+          `${tag}: solo total $${soloTotal} > 415(c) cap $${annual415c}`,
+        );
+      }
+
+      // 6. S-corp cash outflow (wages + employer FICA + employer 401k)
+      //    must fit inside net profit
+      const employerFica =
+        ssTaxable * ssRate + result.sCorpW2 * medRate;
+      const sCorpOutflow =
+        result.sCorpW2 + employerFica + result.soloEmployerContribution;
+      if (sCorpOutflow > profit + 1) {
+        violations.push(
+          `${tag}: S-corp outflow $${sCorpOutflow.toFixed(2)} (W-2 $${result.sCorpW2} + ER FICA $${employerFica.toFixed(2)} + employer 401k $${result.soloEmployerContribution}) exceeds profit $${profit}`,
+        );
+      }
+    }
+
+    if (violations.length > 0) {
+      throw new Error(
+        `Solver invariants violated:\n  ` + violations.slice(0, 10).join("\n  "),
+      );
     }
   });
 
