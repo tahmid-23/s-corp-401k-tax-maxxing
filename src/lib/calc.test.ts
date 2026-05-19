@@ -561,7 +561,17 @@ describe("Tax-optimal target-driven solver", () => {
       inputs: null,
     };
 
-    const maxDDj = Math.min(limit402g, base.dayJobW2 * (1 - 0.062 - 0.0145));
+    // Approximate marginal tax rate at baseline taxable income — matches
+    // what the closed-form solver does for the balanced-paycheck cap.
+    const baselineOut = compute(base);
+    const fedRate = baselineOut.marginalFederalRate;
+    const stateRate = baselineOut.marginalStateRate;
+    const tau = fedRate + stateRate; // (NYC is uncommon in test scenarios)
+    const dayJobFicaRate = base.dayJobW2 <= ssBase ? 0.0765 : 0.0145;
+    const dayJobBalanced =
+      base.dayJobW2 * Math.max(0, (1 - dayJobFicaRate - tau) / (1 - tau));
+
+    const maxDDj = Math.min(limit402g, Math.max(0, dayJobBalanced));
     const matchFloor = Math.min(matchableComp, maxDDj, limit402g);
     const dDjValues: number[] = [];
     for (let d = matchFloor; d <= maxDDj + 1; d += contribStep) {
@@ -571,13 +581,15 @@ describe("Tax-optimal target-driven solver", () => {
 
     for (let W = 0; W <= profit + 1; W += wStep) {
       const erFica = Math.min(W, ssBase) * 0.062 + W * 0.0145;
-      const postFica = W - Math.min(W, ssBase) * 0.062 - W * 0.0145;
+      const sCorpFicaRate = W <= ssBase ? 0.0765 : 0.0145;
+      const sCorpBalanced =
+        W * Math.max(0, (1 - sCorpFicaRate - tau) / (1 - tau));
       const profitRoomE = Math.max(0, profit - W - erFica);
 
       for (const dDj of dDjValues) {
         const match = Math.min(dDj, matchableComp) * base.dayJobMatchPct;
         const room402g = Math.max(0, limit402g - dDj);
-        const maxDSo = Math.min(room402g, Math.max(0, postFica), C415);
+        const maxDSo = Math.min(room402g, Math.max(0, sCorpBalanced), C415);
         for (let dSo = 0; dSo <= maxDSo + 1; dSo += contribStep) {
           const dSoClamped = Math.min(dSo, maxDSo);
           const maxE = Math.min(

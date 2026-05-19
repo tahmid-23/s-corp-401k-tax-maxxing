@@ -1,6 +1,7 @@
-import { FEDERAL } from "./tax-constants";
+import { FEDERAL, STATES, type StatePreset } from "./tax-constants";
 import { compute, type Inputs, type Output } from "./calc";
 import { formatNumber } from "./format";
+import type { Bracket } from "./types";
 
 /**
  * Post-FICA cash from a given S-corp W-2. The IRS limit on elective deferral
@@ -471,6 +472,84 @@ export function totalTaxCost(out: Output): number {
 }
 
 /**
+ * Effective combined marginal rate (federal + state + local) at a given
+ * taxable income. Used to size the balanced-paycheck deferral cap.
+ *
+ * State and local taxes apply to state taxable income (AGI − state
+ * standard deduction). For simplicity here we use AGI ≈ taxable income;
+ * the small std-ded difference doesn't move which bracket binds.
+ */
+function combinedMarginalRate(
+  base: Inputs,
+  taxableIncomeApprox: number,
+): number {
+  const fed = marginalRateAtBracket(
+    taxableIncomeApprox,
+    FEDERAL.brackets[base.filingStatus] as readonly Bracket[],
+  );
+  const statePreset = STATES[base.state] as StatePreset;
+  const stateBrackets = statePreset.brackets[base.filingStatus] as readonly Bracket[];
+  const stateRate = marginalRateAtBracket(taxableIncomeApprox, stateBrackets);
+  let localRate = 0;
+  if (base.nycResident && statePreset.localities?.nyc) {
+    localRate = marginalRateAtBracket(
+      taxableIncomeApprox,
+      statePreset.localities.nyc.brackets[base.filingStatus] as readonly Bracket[],
+    );
+  }
+  return fed + stateRate + localRate;
+}
+
+function marginalRateAtBracket(
+  income: number,
+  brackets: readonly Bracket[],
+): number {
+  if (income <= 0) return brackets[0]?.rate ?? 0;
+  for (const { rate, upTo } of brackets) {
+    if (income <= upTo) return rate;
+  }
+  return brackets[brackets.length - 1]?.rate ?? 0;
+}
+
+/**
+ * Balanced-paycheck deferral cap. Defer at most D such that after FICA
+ * withholding + the deferral + income tax (federal + state + local) on
+ * the taxable portion, your paycheck nets to $0 (no out-of-pocket tax
+ * bill at year-end from this wage).
+ *
+ *   W − f·W − D − τ·(W − D) = 0
+ *   D · (1 − τ) = W · (1 − f − τ)
+ *   D = W · (1 − f − τ) / (1 − τ)
+ *
+ * where f is the employee FICA rate on this paycheck (7.65% below SS
+ * base, 1.45% above) and τ is the combined marginal income tax rate.
+ *
+ * Falls back to post-FICA cash when τ ≥ 1 − f (impossible in practice).
+ */
+function balancedDeferralCap(
+  W: number,
+  fEmployeeFica: number,
+  tauCombinedMarginal: number,
+): number {
+  if (W <= 0) return 0;
+  const numerator = 1 - fEmployeeFica - tauCombinedMarginal;
+  const denominator = 1 - tauCombinedMarginal;
+  if (denominator <= 0) return 0; // pathological; never happens
+  return Math.max(0, W * (numerator / denominator));
+}
+
+/** Employee FICA rate for a paycheck of size W (averaged across SS-base kink). */
+function employeeFicaRateAt(W: number): number {
+  if (W <= 0) return 0;
+  const ssBase = FEDERAL.ssWageBase;
+  // For W entirely below the SS base, f = 0.0765. Above, the SS part
+  // caps. Use the *marginal* rate at the top of W: 0.0145 once W exceeds
+  // the SS base. This is the relevant rate for "the last dollar deferred."
+  if (W <= ssBase) return FEDERAL.ssRateEmployee + FEDERAL.medicareRateEmployee;
+  return FEDERAL.medicareRateEmployee;
+}
+
+/**
  * Given a target total 401(k) contribution T and a fixed S-corp W-2 W,
  * find the (D_dj, D_so, E) split that hits T exactly using the cheapest
  * channels first. Returns null if T is unreachable at this W under the
@@ -478,6 +557,11 @@ export function totalTaxCost(out: Output): number {
  *
  * Fill order: D_dj first (no FICA cost — wage already paid FICA), then
  * D_so, then E. Match floor on D_dj.
+ *
+ * Deferral caps use the balanced-paycheck constraint: D ≤ W·(1−f−τ)/(1−τ)
+ * where τ is the user's combined marginal income tax rate. This ensures
+ * the recommended deferral leaves enough paycheck to cover withholding
+ * (no out-of-pocket bill at year-end).
  */
 function buildInputsForTargetAtW(
   base: Inputs,
@@ -490,13 +574,22 @@ function buildInputsForTargetAtW(
   // Day-job match arithmetic.
   const dayJobMatchableComp = base.dayJobW2 * base.dayJobMatchLimitPct;
 
-  // Post-FICA cash from each W-2 (employee can't defer more than what
-  // arrives in the paycheck).
-  const dayJobPostFica =
-    base.dayJobW2 -
-    Math.min(base.dayJobW2, FEDERAL.ssWageBase) * FEDERAL.ssRateEmployee -
-    base.dayJobW2 * FEDERAL.medicareRateEmployee;
-  const sCorpPostFica = postFicaDeferralCap(W);
+  // Estimate the user's marginal rate at the recommendation (used to
+  // compute the balanced-paycheck deferral cap). We approximate using
+  // baseline taxable income; pretax deferral lowers AGI by the deferred
+  // amount, but for sizing the CAP this is close enough — the cap shrinks
+  // monotonically with τ, so picking τ at the (higher) baseline taxable
+  // income yields a slightly conservative cap, which is fine.
+  const baselineOut = compute(base);
+  const tau = combinedMarginalRate(base, baselineOut.taxableIncome);
+  const dayJobFicaRate = employeeFicaRateAt(base.dayJobW2);
+  const sCorpFicaRate = employeeFicaRateAt(W);
+
+  // Balanced-paycheck cap from each W-2 (defer at most what leaves the
+  // paycheck after FICA + withheld income tax = $0). This replaces the
+  // older post-FICA-only cap.
+  const dayJobBalanced = balancedDeferralCap(base.dayJobW2, dayJobFicaRate, tau);
+  const sCorpBalanced = balancedDeferralCap(W, sCorpFicaRate, tau);
 
   // S-corp profit constraint: W + employerFica(W) + E ≤ profit.
   const erFica = employerFica(W);
@@ -507,7 +600,7 @@ function buildInputsForTargetAtW(
   // and day-job post-FICA cash.
   const dDjCap = Math.min(
     limit402g,
-    Math.max(0, dayJobPostFica),
+    Math.max(0, dayJobBalanced),
     // Conservatively use 415(c) minus the projected match. The match itself
     // depends on D_dj only up to matchableComp, so this is a safe ceiling.
     Math.max(0, C415 - dayJobMatchableComp * base.dayJobMatchPct),
@@ -569,7 +662,7 @@ function buildInputsForTargetAtW(
 
   // At this D_dj, 402(g) room left = limit402g - dDj.
   const room402gSo = Math.max(0, limit402g - dDj);
-  const dSoCap = Math.min(sCorpPostFica, room402gSo, C415);
+  const dSoCap = Math.min(sCorpBalanced, room402gSo, C415);
 
   // Fill E first (no 402(g) consumption), then D_so.
   const E = Math.max(0, Math.min(eCap, residual));
@@ -591,6 +684,58 @@ function buildInputsForTargetAtW(
     soloEmployeeDeferral: dSo,
     soloEmployerContribution: E,
   };
+}
+
+/**
+ * Target-dependent W kinks: the smallest W that makes the target reachable
+ * given the balanced-paycheck cap (where D_so = balanced(W) saturates and
+ * E = 0.25·W saturates simultaneously).
+ *
+ * For target T with day-job match m and matchableComp mc:
+ *   Need: D_dj + match + D_so + E = T
+ *   At the binding W: D_so = bal(W), E = 0.25·W, D_dj = matchableComp (just the match)
+ *   match = min(D_dj, mc)·matchRate = mc·matchRate
+ *   So T_solo := T − matchableComp(1 + matchRate) must come from D_so + E
+ *
+ *   bal(W) = W · k where k = (1 − f − τ)/(1 − τ)
+ *   D_so + E = k·W + 0.25·W = (k + 0.25)·W = T_solo
+ *   W_min = T_solo / (k + 0.25)
+ *
+ * Plus: the W where 402(g) saturates (instead of bal(W) binding), and the
+ * W where E alone (with D_so capped at 402(g) room) handles the rest.
+ */
+function targetSpecificKinks(base: Inputs, target: number): number[] {
+  const profit = Math.max(0, base.sCorpNetProfit);
+  const limit402g = effectiveDeferralLimitForAge(base.age);
+  const baselineOut = compute(base);
+  const tau = combinedMarginalRate(base, baselineOut.taxableIncome);
+  const fLow = FEDERAL.ssRateEmployee + FEDERAL.medicareRateEmployee;
+  const fHigh = FEDERAL.medicareRateEmployee;
+  const erRate = FEDERAL.employerContribPctOfW2;
+
+  // Day-job contribution at the match-capture floor
+  const matchableComp = base.dayJobW2 * base.dayJobMatchLimitPct;
+  // D_dj at match floor + match = matchableComp × (1 + matchRate)
+  const dayJobContribAtFloor = matchableComp * (1 + base.dayJobMatchPct);
+  const tSolo = Math.max(0, target - dayJobContribAtFloor);
+
+  const kLow = Math.max(0, (1 - fLow - tau) / (1 - tau));
+  const kHigh = Math.max(0, (1 - fHigh - tau) / (1 - tau));
+
+  const kinks: number[] = [];
+  // Min W to support tSolo via D_so + E at the balanced cap (below SS base)
+  kinks.push(tSolo / (kLow + erRate));
+  // Min W if W is above SS base
+  kinks.push(tSolo / (kHigh + erRate));
+  // Min W if D_so saturates at 402(g) and E covers the rest:
+  //   E = tSolo − 402(g), and E ≤ 0.25·W → W ≥ 4·(tSolo − 402g)
+  if (tSolo > limit402g) {
+    kinks.push(4 * (tSolo - limit402g));
+  }
+
+  return kinks
+    .filter((w) => Number.isFinite(w) && w >= 0)
+    .map((w) => Math.min(profit, w));
 }
 
 /** All W-level kink points worth evaluating. Clipped to [0, profit]. */
@@ -708,7 +853,7 @@ export function taxOptimalForTarget(
     };
   }
 
-  const candidates = kinkSetForW(base);
+  const candidates = [...kinkSetForW(base), ...targetSpecificKinks(base, target)];
   let best: { inputs: Inputs; out: Output; cost: number } | null = null;
 
   for (const W of candidates) {
