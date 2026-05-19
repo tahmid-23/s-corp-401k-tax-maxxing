@@ -749,7 +749,7 @@ export function taxOptimalForTarget(
   const wChanged =
     Math.abs(best.inputs.sCorpW2Salary - base.sCorpW2Salary) > 0.5;
   const skipEmployer = best.inputs.soloEmployerContribution < 0.5;
-  const note = (() => {
+  const action = (() => {
     const parts: string[] = [];
     if (wChanged) {
       parts.push(
@@ -775,6 +775,13 @@ export function taxOptimalForTarget(
     return parts.join("; ") + ".";
   })();
 
+  // Rationale: explain WHY the recommended W-2 is what it is, when it
+  // changed materially from the user's input.
+  const reason = wChanged
+    ? explainW2Recommendation(base, best.inputs, best.out)
+    : "";
+  const note = reason ? `${action}\n\n${reason}` : action;
+
   return {
     feasible: true,
     sCorpW2: best.inputs.sCorpW2Salary,
@@ -788,3 +795,117 @@ export function taxOptimalForTarget(
     note,
   };
 }
+
+/**
+ * The largest contribution target T such that contributing T does not
+ * reduce net wealth vs contributing nothing.
+ *
+ * Wealth(T) = inflow − tax(T) + T  (the contribution is yours, in 401(k))
+ * Wealth(0) = inflow − tax(0)
+ * Contributing T is wealth-positive iff  T − (tax(T) − tax(0)) ≥ 0
+ * i.e., iff tax(T) − tax(0) ≤ T.
+ *
+ * Binary search over T ∈ [0, ceiling]. The function f(T) = T − (tax(T) −
+ * tax(0)) is not strictly monotonic — it tends to be unimodal (rises while
+ * cheap deferral channels are available, then falls when ramping W-2
+ * starts to cost more in FICA than it saves in deferrals). But because
+ * we only care about the LARGEST T where f(T) ≥ 0, we can binary search
+ * for the rightmost zero crossing.
+ *
+ * Implementation: scan a 32-point grid first to find the crossover, then
+ * binary-search within the bracketing interval. ~40 taxOptimalForTarget
+ * calls total — fast enough for a UI calculation.
+ */
+export function wealthNeutralContribution(base: Inputs): number {
+  const ceiling = maxAchievableContribution(base);
+  if (ceiling <= 0) return 0;
+
+  const taxAtZero = taxAtTarget(base, 0);
+
+  const f = (T: number): number => T - (taxAtTarget(base, T) - taxAtZero);
+
+  // Scan a coarse grid for the largest T with f(T) ≥ 0.
+  const N = 32;
+  let lastPositive = 0;
+  let firstNegativeAfter = -1;
+  for (let i = 0; i <= N; i++) {
+    const T = (i / N) * ceiling;
+    const val = f(T);
+    if (val >= -0.5) {
+      lastPositive = T;
+    } else if (lastPositive >= 0 && firstNegativeAfter < 0) {
+      firstNegativeAfter = T;
+    }
+  }
+
+  if (firstNegativeAfter < 0) {
+    // f never went negative within the ceiling — return the ceiling.
+    return ceiling;
+  }
+
+  // Binary search between lastPositive and firstNegativeAfter for the
+  // crossover.
+  let lo = lastPositive;
+  let hi = firstNegativeAfter;
+  for (let i = 0; i < 24; i++) {
+    const mid = (lo + hi) / 2;
+    if (f(mid) >= 0) lo = mid;
+    else hi = mid;
+    if (hi - lo < 1) break;
+  }
+  return lo;
+}
+
+function taxAtTarget(base: Inputs, target: number): number {
+  const result = taxOptimalForTarget(base, target);
+  return result.feasible ? result.totalTax : Infinity;
+}
+
+/**
+ * One-sentence rationale for the recommended W-2. Picks the dominant
+ * driver from compute() output: QBI wage limit, QBI-eligible profit,
+ * SS-cap interaction, or contribution-funding needed for E.
+ */
+function explainW2Recommendation(
+  base: Inputs,
+  recommended: Inputs,
+  recOut: Output,
+): string {
+  const W = recommended.sCorpW2Salary;
+  const Wuser = base.sCorpW2Salary;
+  const direction = W > Wuser ? "Higher" : "Lower";
+  const baseOut = compute(base);
+  const qbiTh = FEDERAL.qbi.incomeThreshold[base.filingStatus];
+  const qbiPhase = FEDERAL.qbi.phaseoutRange[base.filingStatus];
+
+  // Are we above the QBI income threshold?
+  const aboveThreshold = recOut.taxableIncome > qbiTh;
+  const aboveSstbCutoff = recOut.taxableIncome > qbiTh + qbiPhase;
+  const ssCapMaxed = base.dayJobW2 >= FEDERAL.ssWageBase;
+
+  // Is the W-2 supporting an E that the user couldn't otherwise have?
+  const ESupport = recommended.soloEmployerContribution > 0.5;
+
+  if (base.isSSTB && aboveSstbCutoff) {
+    return `QBI is fully phased out for your SSTB above $${formatNumber(qbiTh + qbiPhase)} taxable income, so the recommendation minimizes W-2 (and FICA) — extra wage offers no QBI benefit to offset the payroll cost.`;
+  }
+
+  if (!base.isSSTB && aboveThreshold && W > Wuser) {
+    return `You're above the $${formatNumber(qbiTh)} QBI income threshold, where the deduction is capped at 50% of your S-corp W-2. Bumping W-2 unlocks ~$${formatNumber(recOut.qbiDeduction - baseOut.qbiDeduction)} more QBI deduction at the cost of ~$${formatNumber(recOut.ssEmployerSCorp + recOut.medicareEmployer - baseOut.ssEmployerSCorp - baseOut.medicareEmployer)} more employer FICA — net positive at your marginal rate.`;
+  }
+
+  if (!aboveThreshold && W < Wuser) {
+    return `You're below the QBI income threshold, where the deduction grows as W-2 shrinks (more profit stays QBI-eligible). Lower W-2 also avoids FICA.`;
+  }
+
+  if (ssCapMaxed && W > Wuser && ESupport) {
+    return `Your day-job already covers the Social Security wage base, so marginal S-corp W-2 incurs only Medicare. Higher W-2 funds more Solo employer contribution at a lower payroll cost than usual.`;
+  }
+
+  if (W < Wuser && !ESupport) {
+    return `${direction} W-2 saves FICA, and there's no Solo employer contribution to justify ramping wages.`;
+  }
+
+  return `${direction} W-2 minimizes total tax at this contribution target.`;
+}
+

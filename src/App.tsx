@@ -4,6 +4,7 @@ import { compute, type Inputs } from "./lib/calc";
 import {
   maxAchievableContribution,
   taxOptimalForTarget,
+  wealthNeutralContribution,
 } from "./lib/solver";
 import {
   FEDERAL,
@@ -50,6 +51,10 @@ export function App() {
   const out = useMemo(() => compute(inputs), [inputs]);
   const maxContribution = useMemo(
     () => maxAchievableContribution(inputs),
+    [inputs],
+  );
+  const wealthNeutralMax = useMemo(
+    () => wealthNeutralContribution(inputs),
     [inputs],
   );
   const optimal = useMemo(
@@ -356,6 +361,24 @@ export function App() {
                 />
               </Field>
               <div className="flex items-baseline justify-between text-sm pt-1">
+                <div>
+                  <div className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">
+                    Wealth-neutral max
+                  </div>
+                  <div className="text-[11px] text-ink-faint italic mt-0.5">
+                    Contributing up to this much costs no net wealth
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTarget401k(Math.floor(wealthNeutralMax))}
+                  className="font-mono tabular-nums text-base text-accent underline decoration-accent/30 underline-offset-2 hover:decoration-accent transition-colors"
+                  title="Set target to this amount"
+                >
+                  {money(Math.floor(wealthNeutralMax))}
+                </button>
+              </div>
+              <div className="flex items-baseline justify-between text-sm">
                 <div>
                   <div className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">
                     Absolute ceiling

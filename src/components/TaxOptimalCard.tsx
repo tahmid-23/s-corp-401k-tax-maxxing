@@ -46,7 +46,7 @@ export function TaxOptimalCard({
           </div>
         )}
       </div>
-      <p className="text-sm leading-relaxed text-ink-soft mb-3">
+      <p className="text-sm leading-relaxed text-ink-soft mb-3 whitespace-pre-line">
         {solution.note}
       </p>
       <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
