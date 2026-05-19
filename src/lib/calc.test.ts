@@ -375,8 +375,33 @@ describe("Solver", () => {
     );
     expect(result.feasible).toBe(false);
     if (!result.feasible) {
-      expect(result.reason).toMatch(/Solo 401\(k\) plan caps out/i);
+      // Message should mention the 415(c)/Solo cap, not profit
+      expect(result.reason).toMatch(/Solo 401\(k\)|415\(c\)|\$72,000/i);
+      expect(result.reason).not.toMatch(/net profit/i);
       expect(result.maximumAchievable).toBeCloseTo(72_000, -1);
+    }
+  });
+
+  it("solver spills to day-job 401(k) when S-corp can't reach the target", () => {
+    // S-corp profit only $10k → small Solo contribution. But day-job has
+    // unused 402(g) room. Target $30k should be reachable by combining.
+    const result = solveForTarget(
+      {
+        ...baseInputs,
+        dayJobW2: 100_000,
+        dayJob401kEmployeeContribution: 0,
+        dayJobMatchPct: 0.5,
+        dayJobMatchLimitPct: 0.06,
+        sCorpNetProfit: 10_000,
+      },
+      30_000,
+    );
+    expect(result.feasible).toBe(true);
+    if (result.feasible) {
+      // Should defer more than just the match-capture at the day job
+      expect(result.dayJobEmployeeDeferral).toBeGreaterThan(6_000);
+      // Total should hit the target
+      expect(result.total).toBeGreaterThanOrEqual(29_999);
     }
   });
 

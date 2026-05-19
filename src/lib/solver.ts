@@ -113,7 +113,7 @@ function solveMinSCorpW2(args: {
 export function solveForTarget(
   inputs: Inputs,
   target: number,
-  options: { maxOutDayJobDeferral?: boolean } = {},
+  _options: { maxOutDayJobDeferral?: boolean } = {},
 ): Solution {
   const effectiveDeferralLimit = ((): number => {
     if (inputs.age >= 60 && inputs.age <= 63) {
@@ -125,16 +125,34 @@ export function solveForTarget(
     return FEDERAL.elective402gLimit;
   })();
 
-  const dayJobMatchCap = inputs.dayJobW2 * inputs.dayJobMatchLimitPct;
+  const dayJobMatchCapPct = inputs.dayJobMatchLimitPct;
+  const dayJobMatchRate = inputs.dayJobMatchPct;
+  const dayJobMatchableComp = inputs.dayJobW2 * dayJobMatchCapPct;
 
-  const dayJobEmployeeDeferral = options.maxOutDayJobDeferral
-    ? Math.min(effectiveDeferralLimit, FEDERAL.annualAdditions415c)
-    : Math.max(0, inputs.dayJob401kEmployeeContribution);
+  // Strategy: prefer consolidating at the S-corp Solo 401(k) (gives the most
+  // contribution per dollar of W-2 ramp via the 25% employer side). But two
+  // exceptions:
+  //   1. Day-job employer match is free dollars — always capture it first
+  //      by routing match-eligible deferrals to the day job.
+  //   2. If the S-corp can't deliver the full target (profit-limited or
+  //      415(c)-limited), spill the unmet portion to day-job deferral up to
+  //      the per-person 402(g) limit.
 
-  const dayJobMatchedBase = Math.min(dayJobEmployeeDeferral, dayJobMatchCap);
-  const dayJobMatch = dayJobMatchedBase * inputs.dayJobMatchPct;
+  // Step 1: capture day-job match. Defer just enough at the day-job to max
+  // the employer match, capped at 402(g) and at the target.
+  const dayJobMatchOptimalDeferral = Math.min(
+    dayJobMatchableComp,
+    effectiveDeferralLimit,
+    Math.max(0, target),
+  );
+  const dayJobMatchAtOptimal =
+    dayJobMatchOptimalDeferral * dayJobMatchRate;
 
-  const targetAfterDayJob = target - dayJobEmployeeDeferral - dayJobMatch;
+  // What remains after the day-job's match-capture contribution + match?
+  let dayJobEmployeeDeferral = dayJobMatchOptimalDeferral;
+  const dayJobMatch = dayJobMatchAtOptimal;
+  let targetAfterDayJob = target - dayJobEmployeeDeferral - dayJobMatch;
+
   if (targetAfterDayJob <= 0) {
     return {
       feasible: true,
@@ -143,52 +161,120 @@ export function solveForTarget(
       soloEmployerContribution: 0,
       dayJobEmployeeDeferral,
       total: dayJobEmployeeDeferral + dayJobMatch,
-      note: "Your day-job contributions alone already meet or exceed the target.",
+      note: dayJobMatch > 0
+        ? `Defer $${formatNumber(dayJobEmployeeDeferral)} at your day job to capture the full $${formatNumber(dayJobMatch)} match. That already meets the target.`
+        : `Defer $${formatNumber(dayJobEmployeeDeferral)} at your day job. That already meets the target.`,
     };
   }
 
-  const deferralRoom = Math.max(
+  // Step 2: try the S-corp Solo for the rest.
+  let deferralRoom = Math.max(
     0,
     effectiveDeferralLimit - dayJobEmployeeDeferral,
   );
 
-  // What's the true ceiling given this user's inputs? It's the lesser of:
-  //   - the 415(c) cap ($72k), which is a federal limit
-  //   - what their S-corp profit can actually deliver (capped W-2)
   const profitCeiling = achievableAtW(inputs.sCorpNetProfit, deferralRoom);
-  const trueCeiling = Math.min(
-    FEDERAL.annualAdditions415c,
-    profitCeiling,
-  );
-  const profitBinds = profitCeiling < FEDERAL.annualAdditions415c;
-
   const sub = solveMinSCorpW2({
     target: targetAfterDayJob,
     deferralRoom,
   });
 
-  // If the solver itself says it's infeasible, the target is above 415(c).
-  // If the solver returned a feasible W-2 but it exceeds the user's profit,
-  // the profit ceiling is binding even though 415(c) wouldn't be.
-  const infeasibleAt415c = !sub.feasible;
-  const infeasibleAtProfit = sub.feasible && sub.w2 > inputs.sCorpNetProfit;
+  const soloFeasible = sub.feasible && sub.w2 <= inputs.sCorpNetProfit;
 
-  if (infeasibleAt415c || infeasibleAtProfit) {
-    const maximumAchievable =
-      dayJobEmployeeDeferral + dayJobMatch + trueCeiling;
+  if (!soloFeasible) {
+    // Step 3: spill the unmet portion to extra day-job deferral.
+    // The S-corp delivers as much as it can; the rest comes from day-job.
+    const soloAchievable = sub.feasible
+      ? Math.min(profitCeiling, FEDERAL.annualAdditions415c)
+      : sub.maxAchievable;
+    // How much of soloAchievable comes from employee deferral (which uses
+    // 402(g) room) vs employer profit-sharing (which doesn't)?
+    const soloEmployeeDeferralAtCap = Math.min(
+      deferralRoom,
+      postFicaDeferralCap(Math.min(inputs.sCorpNetProfit, sub.feasible ? sub.w2 : inputs.sCorpNetProfit)),
+    );
+    const stillNeeded = targetAfterDayJob - soloAchievable;
+    // Day-job deferrals beyond the match cap don't earn more match, so
+    // spilling here costs nothing extra and just consumes 402(g) room.
+    // Available 402(g) room after day-job match capture AND solo employee
+    // deferral are both counted.
+    const extraDayJobRoom = Math.max(
+      0,
+      effectiveDeferralLimit -
+        dayJobEmployeeDeferral -
+        soloEmployeeDeferralAtCap,
+    );
+    const extraDayJob = Math.min(stillNeeded, extraDayJobRoom);
 
-    // Use the binding-constraint message: profit if that's the lower wall,
-    // 415(c) otherwise.
-    const reason = profitBinds
-      ? `Your S-corp's net profit of $${formatNumber(inputs.sCorpNetProfit)} caps the W-2 you can pay yourself, which in turn caps the Solo 401(k) at $${formatNumber(profitCeiling)}. The business needs more profit to reach this target.`
-      : `One Solo 401(k) plan caps out at $${formatNumber(FEDERAL.annualAdditions415c)} in total contributions per year, and your target is above that. You'd need a second unrelated employer's 401(k) to go higher.`;
+    if (extraDayJob > 0) {
+      dayJobEmployeeDeferral += extraDayJob;
+      deferralRoom = Math.max(
+        0,
+        effectiveDeferralLimit - dayJobEmployeeDeferral,
+      );
+      targetAfterDayJob -= extraDayJob;
+    }
 
+    // Now re-solve the S-corp side with the (possibly reduced) residual.
+    const sub2 = solveMinSCorpW2({
+      target: targetAfterDayJob,
+      deferralRoom,
+    });
+    const stillInfeasible =
+      !sub2.feasible || sub2.w2 > inputs.sCorpNetProfit;
+
+    if (stillInfeasible) {
+      // What's the true Solo ceiling? It's the lesser of profit-capped
+      // achievable and the 415(c) federal cap.
+      const profitCappedSolo = achievableAtW(
+        inputs.sCorpNetProfit,
+        deferralRoom,
+      );
+      const reachableSolo = Math.min(
+        profitCappedSolo,
+        FEDERAL.annualAdditions415c,
+      );
+      const maximumAchievable =
+        dayJobEmployeeDeferral + dayJobMatch + reachableSolo;
+
+      // Profit is the binding wall when it caps the Solo below the federal
+      // 415(c) limit.
+      const profitBinds = profitCappedSolo < FEDERAL.annualAdditions415c;
+      const reason = profitBinds
+        ? `Your S-corp's net profit of $${formatNumber(inputs.sCorpNetProfit)} caps how much the Solo 401(k) can deliver at $${formatNumber(profitCappedSolo)}, and you've already maxed what the day-job 401(k) can carry. The business needs more profit to reach this target.`
+        : `You've maxed the per-person elective deferral limit and one Solo 401(k) caps at $${formatNumber(FEDERAL.annualAdditions415c)} per year. A second unrelated employer's 401(k) would let you go higher.`;
+
+      return {
+        feasible: false,
+        reason,
+        maximumAchievable,
+      };
+    }
+
+    // We can reach the target with the day-job spill.
     return {
-      feasible: false,
-      reason,
-      maximumAchievable,
+      feasible: true,
+      sCorpW2: sub2.w2,
+      soloEmployeeDeferral: sub2.deferral,
+      soloEmployerContribution: sub2.employer,
+      dayJobEmployeeDeferral,
+      total:
+        dayJobEmployeeDeferral + dayJobMatch + sub2.deferral + sub2.employer,
+      note:
+        extraDayJob > 0
+          ? `Your S-corp alone can't reach the target. Defer $${formatNumber(dayJobEmployeeDeferral)} at the day job (which earns a $${formatNumber(dayJobMatch)} match) and set S-corp W-2 to $${formatNumber(sub2.w2)} with $${formatNumber(sub2.deferral)} employee + $${formatNumber(sub2.employer)} employer at the Solo 401(k).`
+          : `Defer $${formatNumber(dayJobEmployeeDeferral)} at the day job for the match. Set S-corp W-2 to $${formatNumber(sub2.w2)}, with $${formatNumber(sub2.deferral)} employee + $${formatNumber(sub2.employer)} employer at the Solo 401(k).`,
     };
   }
+
+  const dayJobNote =
+    dayJobMatch > 0
+      ? `Defer $${formatNumber(dayJobEmployeeDeferral)} at your day job to capture the full $${formatNumber(dayJobMatch)} match. `
+      : "";
+  const sCorpNote =
+    sub.w2 <= inputs.sCorpW2Salary
+      ? `Your current S-corp W-2 of $${formatNumber(inputs.sCorpW2Salary)} is already enough — contribute $${formatNumber(sub.deferral)} as employee deferral and $${formatNumber(sub.employer)} as employer profit-sharing at the Solo 401(k).`
+      : `Set S-corp W-2 to $${formatNumber(sub.w2)}, with $${formatNumber(sub.deferral)} as employee deferral and $${formatNumber(sub.employer)} as employer profit-sharing at the Solo 401(k).`;
 
   return {
     feasible: true,
@@ -197,10 +283,7 @@ export function solveForTarget(
     soloEmployerContribution: sub.employer,
     dayJobEmployeeDeferral,
     total: dayJobEmployeeDeferral + dayJobMatch + sub.deferral + sub.employer,
-    note:
-      sub.w2 <= inputs.sCorpW2Salary
-        ? `Your current S-corp W-2 of $${formatNumber(inputs.sCorpW2Salary)} is already enough. Contribute $${formatNumber(sub.deferral)} as employee deferral and $${formatNumber(sub.employer)} as employer profit-sharing at the Solo 401(k).`
-        : `Set S-corp W-2 to $${formatNumber(sub.w2)}. Contribute $${formatNumber(sub.deferral)} as employee deferral and $${formatNumber(sub.employer)} as employer profit-sharing at the Solo 401(k).`,
+    note: dayJobNote + sCorpNote,
   };
 }
 
