@@ -345,7 +345,7 @@ export function App() {
                 </span>
                 <button
                   type="button"
-                  onClick={() => setTarget401k(Math.round(maxContribution))}
+                  onClick={() => setTarget401k(Math.floor(maxContribution))}
                   className="font-mono tabular-nums text-base text-accent underline decoration-accent/30 underline-offset-2 hover:decoration-accent transition-colors"
                   title="Click to set target to this amount"
                 >
