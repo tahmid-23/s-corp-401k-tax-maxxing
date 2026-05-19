@@ -4,6 +4,7 @@ import { compute, type Inputs } from "./lib/calc";
 import {
   maxAchievableContribution,
   taxOptimalForTarget,
+  wealthNeutralContribution,
 } from "./lib/solver";
 import {
   FEDERAL,
@@ -52,6 +53,12 @@ export function App() {
     () => maxAchievableContribution(inputs),
     [inputs],
   );
+  const wealthNeutralMax = useMemo(
+    () => wealthNeutralContribution(inputs),
+    [inputs],
+  );
+  const wealthNeutralDiffers =
+    Math.floor(maxContribution) - Math.floor(wealthNeutralMax) > 10;
   const optimal = useMemo(
     () =>
       target401k != null && target401k > 0
@@ -355,6 +362,26 @@ export function App() {
                   step={1_000}
                 />
               </Field>
+              {wealthNeutralDiffers && (
+                <div className="flex items-baseline justify-between text-sm pt-1">
+                  <div>
+                    <div className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">
+                      Beyond this, contributing loses wealth
+                    </div>
+                    <div className="text-[11px] text-ink-faint italic mt-0.5">
+                      At your marginal rate, FICA on the W-2 ramp starts to outweigh the deferral tax savings
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setTarget401k(Math.floor(wealthNeutralMax))}
+                    className="font-mono tabular-nums text-base text-accent underline decoration-accent/30 underline-offset-2 hover:decoration-accent transition-colors"
+                    title="Set target to this amount"
+                  >
+                    {money(Math.floor(wealthNeutralMax))}
+                  </button>
+                </div>
+              )}
               <div className="flex items-baseline justify-between text-sm pt-1">
                 <div>
                   <div className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">

@@ -797,6 +797,70 @@ export function taxOptimalForTarget(
 }
 
 /**
+ * The largest contribution target T such that contributing T does not
+ * reduce net wealth vs contributing nothing.
+ *
+ *   wealth(T) = inflow − tax(T) + T   (401(k) at face)
+ *   wealth(0) = inflow − tax(0)
+ *   contributing T is wealth-positive iff  T − (tax(T) − tax(0)) ≥ 0
+ *
+ * For most users (high day-job income, state tax, well above the
+ * ~15% breakeven marginal rate), this equals the absolute ceiling —
+ * pretax deferral always saves more in income tax than the W-2 ramp
+ * costs in FICA. But for low-income S-corp owners (sub-12% marginal,
+ * no day job, no state tax), the FICA cost can exceed the deferral
+ * savings, and this T sits below the ceiling. UI should highlight the
+ * difference when it's > $0.
+ *
+ * Implementation: scan a 32-point grid for the rightmost wealth-positive
+ * T, then bisect between the last positive and first negative grid
+ * points. ~40 taxOptimalForTarget calls per evaluation.
+ */
+export function wealthNeutralContribution(base: Inputs): number {
+  const ceiling = maxAchievableContribution(base);
+  if (ceiling <= 0) return 0;
+
+  const t0 = taxOptimalForTarget(base, 0);
+  if (!t0.feasible) return 0;
+  const taxAtZero = t0.totalTax;
+
+  const wealthGain = (T: number): number => {
+    const r = taxOptimalForTarget(base, T);
+    if (!r.feasible) return -Infinity;
+    return T - (r.totalTax - taxAtZero);
+  };
+
+  // Scan grid for the largest T with non-negative wealth gain.
+  const N = 32;
+  let lastPositive = 0;
+  let firstNegativeAfter = -1;
+  for (let i = 0; i <= N; i++) {
+    const T = (i / N) * ceiling;
+    const val = wealthGain(T);
+    if (val >= -0.5) {
+      lastPositive = T;
+    } else if (firstNegativeAfter < 0) {
+      firstNegativeAfter = T;
+    }
+  }
+
+  if (firstNegativeAfter < 0) {
+    return ceiling;
+  }
+
+  // Bisect for the crossover.
+  let lo = lastPositive;
+  let hi = firstNegativeAfter;
+  for (let i = 0; i < 24; i++) {
+    const mid = (lo + hi) / 2;
+    if (wealthGain(mid) >= 0) lo = mid;
+    else hi = mid;
+    if (hi - lo < 1) break;
+  }
+  return lo;
+}
+
+/**
  * One-sentence rationale for the recommended W-2. Picks the dominant
  * driver from compute() output: QBI wage limit, QBI-eligible profit,
  * SS-cap interaction, or contribution-funding needed for E.
