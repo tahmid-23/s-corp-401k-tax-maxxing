@@ -374,12 +374,11 @@ export function solveForTarget(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tax-optimal solver
+// Tax-optimal solver (target-driven)
 //
-// The user's lever is sCorpW2 (W) plus three contribution amounts:
-//    D_dj  = day-job employee deferral
-//    D_so  = solo employee deferral
-//    E     = solo employer contribution
+// Given a desired total 401(k) contribution T, finds (W, D_dj, D_so, E) that
+// hits T exactly with minimum total tax. The user picks T (how much retirement
+// savings they want); the calculator picks the cheapest path to deliver it.
 //
 // Objective: minimize total non-recoverable cost this year
 //    federal + state + local + state surtax
@@ -389,14 +388,7 @@ export function solveForTarget(
 //      + employee additional Medicare
 //      + employee SS net of refundable excess
 //
-// The function totalTaxCost(W, D_dj, D_so, E) is piecewise-linear over each
-// of its inputs: kinks happen at the SS wage base, the QBI threshold and
-// phaseout end, the federal bracket boundaries, and the cap-binding points
-// for D_dj, D_so, and E. So the minimum is at one of a finite set of
-// candidate (W, D_dj, D_so, E) tuples.
-//
-// Outer optimization (over W):
-//   We enumerate the kink set in W:
+// Outer optimization (over W): enumerate the kink set:
 //     - W = 0
 //     - W = max(0, ssWageBase − dayJobSSWages)  (S-corp first crosses
 //       combined SS cap; below this, no employer-SS waste at the S-corp)
@@ -407,24 +399,25 @@ export function solveForTarget(
 //     - W = profit  (no distribution at all)
 //     - W such that postFica(W) = 402(g) room  (regime A↔B for D_so)
 //     - W at QBI income threshold and phaseout end
-//     - the user's current sCorpW2Salary (so the recommendation is at least
-//       no worse than what they already have)
+//     - federal bracket boundaries (cost surface kinks at TI = bracket)
+//     - the user's current sCorpW2Salary
+//     - a 50-point grid across [0, profit] as belt-and-suspenders
 //
-// Inner optimization (given W): pick (D_dj, D_so, E) that minimizes cost.
-// Pretax employee deferrals reduce taxable income with no FICA cost (the
-// wage already paid FICA when generated), so they monotonically reduce
-// tax — always max them out, up to caps. Roth deferrals are tax-neutral
-// for this year — recommend the same amounts as if traditional (the user
-// chose the type elsewhere). E reduces QBI by ~$1 per $1, which costs
-// 20%·marginal of federal tax; whether that's worth it depends on the
-// user's preference, so we compute two candidates per W:
-//   - "skip employer": E = 0, just D_dj and D_so
-//   - "fund employer": E maxed up to all caps
-// and pick the cheaper of the two by total-tax. (Going "all-in on E"
-// strictly maximizes contribution; going "E = 0" strictly minimizes
-// federal tax this year, since each E dollar costs 20%·marginal in QBI
-// loss. The breakeven varies with marginal rate, so let the numbers
-// decide.)
+// Inner sub-optimization (given W and target T): fill the target exactly.
+// Pretax employee deferrals save current-year tax with no FICA cost (the
+// wage already paid FICA when generated). E doesn't save tax (just adds to
+// the 401(k)), so we route as many target dollars as possible through D's
+// before falling back to E. Two D channels:
+//   - D_dj at the day job: comes from day-job W-2 cash, costs nothing
+//     beyond what's already paid (FICA on dayJobW2 is sunk).
+//   - D_so at the Solo: comes from S-corp W-2 cash. To "fund" D_so at the
+//     margin requires more W, which costs S-corp FICA.
+// So D_dj > D_so > E in tax-efficiency order. We always fill in that order.
+//
+// Hard constraints respected: 402(g) per-person, 415(c) per-employer, 25%
+// rule on E, post-FICA cash on D_so, day-job 415(c)/cash on D_dj, S-corp
+// cash flow W + er-FICA + E ≤ profit. Match floor: D_dj always ≥
+// matchableComp so the free employer match is captured.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function effectiveDeferralLimitForAge(age: number): number {
@@ -478,117 +471,125 @@ export function totalTaxCost(out: Output): number {
 }
 
 /**
- * For a given W (and the rest of the inputs fixed), build the inputs that
- * realize a particular contribution policy.
+ * Given a target total 401(k) contribution T and a fixed S-corp W-2 W,
+ * find the (D_dj, D_so, E) split that hits T exactly using the cheapest
+ * channels first. Returns null if T is unreachable at this W under the
+ * relevant caps.
  *
- *   policy = "max": fill E up to all caps, then fill D_solo and D_dj to
- *           max out 402(g). This is "max-401k" behavior.
- *   policy = "noEmployer": E = 0; fill D_dj and D_solo only. This is
- *           "min-tax-this-year-via-zero-QBI-loss" behavior.
- *
- * Both candidates respect all hard caps (402(g), 415(c), 25% rule, post-FICA
- * cash, profit cash-out).
+ * Fill order: D_dj first (no FICA cost — wage already paid FICA), then
+ * D_so, then E. Match floor on D_dj.
  */
-function buildInputsAtW(
+function buildInputsForTargetAtW(
   base: Inputs,
   W: number,
-  policy: "max" | "noEmployer",
-): Inputs {
+  target: number,
+): Inputs | null {
   const limit402g = effectiveDeferralLimitForAge(base.age);
   const C415 = FEDERAL.annualAdditions415c;
 
-  // Day-job deferral: bounded by 402(g) (combined), day-job 415(c)
-  // (minus match), and the day-job's own cash post-FICA. We model the
-  // day-job match as already-included in match earnings; the deferral
-  // itself is independent.
+  // Day-job match arithmetic.
   const dayJobMatchableComp = base.dayJobW2 * base.dayJobMatchLimitPct;
-  const dayJobMatchedBase = Math.min(dayJobMatchableComp, limit402g);
-  const dayJobMatch = dayJobMatchedBase * base.dayJobMatchPct;
 
-  // Post-FICA cash from each W-2. Even if SS would be partially refundable
-  // in aggregate, the employer still withholds it pre-deferral, so it bounds
-  // the deferral.
+  // Post-FICA cash from each W-2 (employee can't defer more than what
+  // arrives in the paycheck).
   const dayJobPostFica =
     base.dayJobW2 -
     Math.min(base.dayJobW2, FEDERAL.ssWageBase) * FEDERAL.ssRateEmployee -
     base.dayJobW2 * FEDERAL.medicareRateEmployee;
   const sCorpPostFica = postFicaDeferralCap(W);
 
-  // Day-job 415(c) leaves room = 72k − match − D_dj. We need D_dj ≤
-  // 72k − match. (Employee deferrals already inside 415(c) for that plan.)
-  const dayJob415cRoomForDeferral = Math.max(0, C415 - dayJobMatch);
-
   // S-corp profit constraint: W + employerFica(W) + E ≤ profit.
   const erFica = employerFica(W);
   const profitRoomForE = Math.max(0, base.sCorpNetProfit - W - erFica);
 
-  // Caps before we allocate.
-  const dDjMax = Math.min(
+  // Day-job cap on D_dj: 402(g), day-job 415(c) net of match (we add match
+  // below, so the cap is approximated as the deferral itself ≤ 415(c)),
+  // and day-job post-FICA cash.
+  const dDjCap = Math.min(
     limit402g,
-    dayJob415cRoomForDeferral,
     Math.max(0, dayJobPostFica),
+    // Conservatively use 415(c) minus the projected match. The match itself
+    // depends on D_dj only up to matchableComp, so this is a safe ceiling.
+    Math.max(0, C415 - dayJobMatchableComp * base.dayJobMatchPct),
   );
 
-  // Floor: always capture the day-job employer match. It's free money — the
-  // optimizer should never recommend forfeiting it. The match is earned on
-  // each dollar of D_dj up to dayJobMatchableComp.
-  const dDjFloor = Math.max(
-    0,
-    Math.min(dayJobMatchableComp, dDjMax, limit402g),
-  );
-
-  if (policy === "noEmployer") {
-    // E = 0. Max D_dj first (captures the match and uses 402(g) room), then
-    // max D_solo with what's left. With E = 0, D_dj and D_solo are both
-    // pure tax savings; allocating to D_dj first keeps the FICA cost out
-    // of the recommendation (FICA on day-job wages is sunk).
-    const dDj = Math.max(dDjFloor, 0); // at least capture the match
-    // Then fill toward the per-person 402(g) limit if there's room in
-    // day-job 415(c) and day-job cash.
-    const dDjFull = Math.max(dDj, Math.min(dDjMax, limit402g));
-    const room = Math.max(0, limit402g - dDjFull);
-    const dSoMax = Math.min(
-      room,
-      Math.max(0, sCorpPostFica),
-      C415, // solo 415(c) − E, with E = 0
-    );
-    return {
-      ...base,
-      sCorpW2Salary: W,
-      dayJob401kEmployeeContribution: dDjFull,
-      soloEmployeeDeferral: dSoMax,
-      soloEmployerContribution: 0,
-    };
-  }
-
-  // policy = "max": fill E first (employer-side has its own 415(c) ceiling
-  // independent of the day-job; it also doesn't consume 402(g)). Then fill
-  // D_solo against 402(g) and the solo 415(c) net of E. Then fill D_dj
-  // against the remaining 402(g) — but never below dDjFloor (the match
-  // capture).
-  const eMax = Math.min(
+  const eCap = Math.min(
     W * FEDERAL.employerContribPctOfW2,
     C415,
     profitRoomForE,
   );
-  // Make sure we don't let dSo eat the room that D_dj needs to reach the
-  // match-floor.
-  const room402gForSoloAfterFloor = Math.max(0, limit402g - dDjFloor);
-  const dSoMax2 = Math.min(
-    Math.max(0, sCorpPostFica),
-    room402gForSoloAfterFloor,
-    Math.max(0, C415 - eMax),
-  );
-  const dDjMax2 = Math.max(
-    dDjFloor,
-    Math.min(dDjMax, limit402g - dSoMax2),
-  );
+
+  // Match-capture floor on D_dj (free money).
+  const dDjFloor = Math.min(dayJobMatchableComp, dDjCap);
+  const matchAtFloor = dDjFloor * base.dayJobMatchPct;
+
+  // Hitting target with D_dj alone (sub-match-floor): only viable if T is
+  // small enough.
+  // Total at D_dj ∈ [0, matchableComp]:  D_dj × (1 + matchRate)
+  // Total at D_dj ∈ (matchableComp, dDjCap]:  D_dj + matchableComp × matchRate
+  const matchAtDDjCap = matchAtFloor; // doesn't grow past matchableComp
+  const totalAtDDjCap = Math.min(dDjCap, limit402g) + matchAtDDjCap;
+
+  if (target <= dDjFloor + matchAtFloor + 0.5) {
+    // D_dj ≤ matchableComp suffices. Solve: T = D_dj × (1 + matchRate)
+    const dDj = target / (1 + base.dayJobMatchPct);
+    return {
+      ...base,
+      sCorpW2Salary: W,
+      dayJob401kEmployeeContribution: dDj,
+      soloEmployeeDeferral: 0,
+      soloEmployerContribution: 0,
+    };
+  }
+
+  if (target <= totalAtDDjCap + 0.5) {
+    // D_dj > matchableComp but ≤ dDjCap suffices. Match is capped at
+    // matchableComp × matchRate. D_dj = T − match.
+    const dDj = Math.min(
+      Math.max(0, target - matchAtFloor),
+      Math.min(dDjCap, limit402g),
+    );
+    return {
+      ...base,
+      sCorpW2Salary: W,
+      dayJob401kEmployeeContribution: dDj,
+      soloEmployeeDeferral: 0,
+      soloEmployerContribution: 0,
+    };
+  }
+
+  // Target requires Solo participation. Set D_dj to its cap (maximizes
+  // pretax deferral and uses 402(g) — extra D_dj past matchableComp earns
+  // no match but reduces the W needed to fund D_so. This is the
+  // tax-cheapest allocation: at fixed W, every $1 of D is a deferral; the
+  // marginal cost difference is in W, which scales with D_so demand.)
+  const dDj = Math.min(dDjCap, limit402g);
+  const match = Math.min(dDj, dayJobMatchableComp) * base.dayJobMatchPct;
+  let residual = target - dDj - match;
+
+  // At this D_dj, 402(g) room left = limit402g - dDj.
+  const room402gSo = Math.max(0, limit402g - dDj);
+  const dSoCap = Math.min(sCorpPostFica, room402gSo, C415);
+
+  // Fill E first (no 402(g) consumption), then D_so.
+  const E = Math.max(0, Math.min(eCap, residual));
+  residual -= E;
+  const dSo = Math.max(0, Math.min(dSoCap, Math.max(0, C415 - E), residual));
+  residual -= dSo;
+
+  // If still residual: target unreachable at this W. Shifting dDj→dSo
+  // doesn't increase total contribution (both eat 402(g)), so it doesn't
+  // help. Return null and let the outer loop try a larger W.
+  if (residual > 0.5) {
+    return null;
+  }
+
   return {
     ...base,
     sCorpW2Salary: W,
-    dayJob401kEmployeeContribution: dDjMax2,
-    soloEmployeeDeferral: dSoMax2,
-    soloEmployerContribution: eMax,
+    dayJob401kEmployeeContribution: dDj,
+    soloEmployeeDeferral: dSo,
+    soloEmployerContribution: E,
   };
 }
 
@@ -635,11 +636,11 @@ function kinkSetForW(base: Inputs): number[] {
   const qbiPhase = FEDERAL.qbi.phaseoutRange[base.filingStatus];
 
   // Some extra granular candidates to defend against the bracket / QBI
-  // approximation above. 50 evenly-spaced points across [0, profit] is
-  // cheap (each evaluation is ~one compute() call), and combined with the
-  // structural kinks gives belt-and-suspenders coverage.
+  // approximation above. 200 evenly-spaced points across [0, profit] keeps
+  // step ≤ ~$500 for typical profits, denser than any reasonable brute-
+  // force grid.
   const grid: number[] = [];
-  const N = 50;
+  const N = 200;
   for (let i = 0; i <= N; i++) grid.push((i / N) * profit);
 
   const candidates = [
@@ -664,56 +665,86 @@ function kinkSetForW(base: Inputs): number[] {
   return Array.from(new Set(clipped.map((w) => Math.round(w * 100) / 100)));
 }
 
-export type TaxOptimalSolution = {
-  sCorpW2: number;
-  dayJobEmployeeDeferral: number;
-  soloEmployeeDeferral: number;
-  soloEmployerContribution: number;
-  totalContribution: number;
-  totalTax: number;
-  /**
-   * Total tax under the user's currently-entered inputs, for comparison.
-   */
-  baselineTax: number;
-  /**
-   * baselineTax − totalTax. Positive = recommendation saves money.
-   */
-  savingsVsCurrent: number;
-  note: string;
-};
+export type TaxOptimalSolution =
+  | {
+      feasible: true;
+      sCorpW2: number;
+      dayJobEmployeeDeferral: number;
+      soloEmployeeDeferral: number;
+      soloEmployerContribution: number;
+      totalContribution: number;
+      totalTax: number;
+      /**
+       * Total tax under the user's currently-entered inputs, for comparison.
+       */
+      baselineTax: number;
+      /**
+       * baselineTax − totalTax. Positive = recommendation saves money.
+       */
+      savingsVsCurrent: number;
+      note: string;
+    }
+  | {
+      feasible: false;
+      reason: string;
+      maximumAchievable: number;
+    };
 
-export function taxOptimalSolution(base: Inputs): TaxOptimalSolution {
+/**
+ * Find the (W, D_dj, D_so, E) that delivers exactly `target` of total 401(k)
+ * contribution with the minimum total tax. Returns infeasibility when the
+ * target exceeds the absolute ceiling.
+ */
+export function taxOptimalForTarget(
+  base: Inputs,
+  target: number,
+): TaxOptimalSolution {
+  const ceiling = maxAchievableContribution(base);
+  if (target > ceiling + 0.5) {
+    return {
+      feasible: false,
+      reason: `Target of $${formatNumber(target)} exceeds the absolute ceiling of $${formatNumber(ceiling)} for your inputs.`,
+      maximumAchievable: ceiling,
+    };
+  }
+
   const candidates = kinkSetForW(base);
   let best: { inputs: Inputs; out: Output; cost: number } | null = null;
 
   for (const W of candidates) {
-    for (const policy of ["max", "noEmployer"] as const) {
-      const candInputs = buildInputsAtW(base, W, policy);
-      const out = compute(candInputs);
-      const cost = totalTaxCost(out);
-      if (best === null || cost < best.cost - 1e-6) {
-        best = { inputs: candInputs, out, cost };
-      }
+    const candInputs = buildInputsForTargetAtW(base, W, target);
+    if (candInputs === null) continue;
+    const out = compute(candInputs);
+    const cost = totalTaxCost(out);
+    if (best === null || cost < best.cost - 1e-6) {
+      best = { inputs: candInputs, out, cost };
     }
   }
 
   if (!best) {
-    // Should never happen — kinkSetForW always returns at least [0].
-    throw new Error("taxOptimalSolution: no candidates evaluated");
+    // Should not happen — at least one W in the kink set should reach the
+    // target if target ≤ ceiling.
+    return {
+      feasible: false,
+      reason: `No (W-2, deferral, employer) combination hits a $${formatNumber(target)} target. This is likely an internal solver miss; try adjusting inputs.`,
+      maximumAchievable: ceiling,
+    };
   }
 
   const baseline = compute(base);
   const baselineCost = totalTaxCost(baseline);
 
+  const matchEarned =
+    Math.min(
+      best.inputs.dayJobW2 * best.inputs.dayJobMatchLimitPct,
+      best.inputs.dayJob401kEmployeeContribution,
+    ) * best.inputs.dayJobMatchPct;
+
   const totalContribution =
     best.inputs.dayJob401kEmployeeContribution +
     best.inputs.soloEmployeeDeferral +
     best.inputs.soloEmployerContribution +
-    Math.min(
-      best.inputs.dayJobW2 * best.inputs.dayJobMatchLimitPct,
-      best.inputs.dayJob401kEmployeeContribution,
-    ) *
-      best.inputs.dayJobMatchPct;
+    matchEarned;
 
   const wChanged =
     Math.abs(best.inputs.sCorpW2Salary - base.sCorpW2Salary) > 0.5;
@@ -728,7 +759,8 @@ export function taxOptimalSolution(base: Inputs): TaxOptimalSolution {
       parts.push(`Keep S-corp W-2 at $${formatNumber(base.sCorpW2Salary)}`);
     }
     parts.push(
-      `defer $${formatNumber(best.inputs.dayJob401kEmployeeContribution)} at the day job`,
+      `defer $${formatNumber(best.inputs.dayJob401kEmployeeContribution)} at the day job` +
+        (matchEarned > 0 ? ` (earns $${formatNumber(matchEarned)} match)` : ""),
     );
     if (best.inputs.soloEmployeeDeferral > 0.5) {
       parts.push(
@@ -739,13 +771,12 @@ export function taxOptimalSolution(base: Inputs): TaxOptimalSolution {
       parts.push(
         `$${formatNumber(best.inputs.soloEmployerContribution)} as Solo employer`,
       );
-    } else {
-      parts.push("skip the Solo employer contribution");
     }
     return parts.join("; ") + ".";
   })();
 
   return {
+    feasible: true,
     sCorpW2: best.inputs.sCorpW2Salary,
     dayJobEmployeeDeferral: best.inputs.dayJob401kEmployeeContribution,
     soloEmployeeDeferral: best.inputs.soloEmployeeDeferral,

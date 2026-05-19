@@ -3,8 +3,7 @@ import { motion } from "motion/react";
 import { compute, type Inputs } from "./lib/calc";
 import {
   maxAchievableContribution,
-  solveForTarget,
-  taxOptimalSolution,
+  taxOptimalForTarget,
 } from "./lib/solver";
 import {
   FEDERAL,
@@ -22,7 +21,6 @@ import { SegmentedToggle } from "./components/SegmentedToggle";
 import { LimitBar } from "./components/LimitBar";
 import { DiagnosticRow } from "./components/DiagnosticRow";
 import { Explainer } from "./components/Explainer";
-import { SolverCard } from "./components/SolverCard";
 import { TaxOptimalCard } from "./components/TaxOptimalCard";
 
 const DEFAULT_INPUTS: Inputs = {
@@ -54,9 +52,16 @@ export function App() {
     () => maxAchievableContribution(inputs),
     [inputs],
   );
-  const optimal = useMemo(() => taxOptimalSolution(inputs), [inputs]);
+  const optimal = useMemo(
+    () =>
+      target401k != null && target401k > 0
+        ? taxOptimalForTarget(inputs, target401k)
+        : null,
+    [inputs, target401k],
+  );
 
   const applyOptimal = () => {
+    if (!optimal || !optimal.feasible) return;
     setInputs((p) => ({
       ...p,
       sCorpW2Salary: Math.round(optimal.sCorpW2),
@@ -65,14 +70,6 @@ export function App() {
       soloEmployerContribution: Math.round(optimal.soloEmployerContribution),
     }));
   };
-
-  const solution = useMemo(
-    () =>
-      target401k != null && target401k > 0
-        ? solveForTarget(inputs, target401k, { maxOutDayJobDeferral: false })
-        : null,
-    [inputs, target401k],
-  );
 
   const set = <K extends keyof Inputs>(k: K, v: Inputs[K]) =>
     setInputs((p) => ({ ...p, [k]: v }));
@@ -347,23 +344,9 @@ export function App() {
                   step={5_000}
                 />
               </Field>
-              <TaxOptimalCard solution={optimal} onApply={applyOptimal} />
-              <div className="flex items-baseline justify-between text-sm pt-3 mt-3 border-t border-rule-soft">
-                <div>
-                  <div className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">
-                    Absolute ceiling
-                  </div>
-                  <div className="text-[11px] text-ink-faint italic mt-0.5">
-                    What you could cram into 401(k) ignoring tax cost
-                  </div>
-                </div>
-                <span className="font-mono tabular-nums text-base text-ink">
-                  {money(Math.floor(maxContribution))}
-                </span>
-              </div>
               <Field
-                label="Target 401(k) total (optional)"
-                hint="Enter a target and you'll see what salary and split would get you there."
+                label="Target 401(k) total"
+                hint="How much do you want to put into 401(k) this year? The solver will find the lowest-tax way to deliver it."
               >
                 <NumberInput
                   value={target401k ?? 0}
@@ -372,7 +355,22 @@ export function App() {
                   step={1_000}
                 />
               </Field>
-              {solution && <SolverCard solution={solution} />}
+              <div className="flex items-baseline justify-between text-sm pt-1">
+                <div>
+                  <div className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">
+                    Absolute ceiling
+                  </div>
+                  <div className="text-[11px] text-ink-faint italic mt-0.5">
+                    What you could cram in if tax cost were no object
+                  </div>
+                </div>
+                <span className="font-mono tabular-nums text-base text-ink">
+                  {money(Math.floor(maxContribution))}
+                </span>
+              </div>
+              {optimal && (
+                <TaxOptimalCard solution={optimal} onApply={applyOptimal} />
+              )}
             </Card>
           </motion.div>
 

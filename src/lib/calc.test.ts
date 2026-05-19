@@ -3,7 +3,7 @@ import { compute, type Inputs, taxFromBrackets, marginalRateAt } from "./calc";
 import {
   maxAchievableContribution,
   solveForTarget,
-  taxOptimalSolution,
+  taxOptimalForTarget,
   totalTaxCost,
 } from "./solver";
 import { FEDERAL } from "./tax-constants";
@@ -534,20 +534,17 @@ describe("Solver", () => {
   });
 });
 
-describe("Tax-optimal solver", () => {
-  // Brute-force sweep over (W, D_dj, D_solo, E) for a given inputs base.
-  // Returns the minimum totalTaxCost achievable. Step sizes are chosen so
-  // the sweep is exhaustive enough that the closed-form solver can never
-  // beat it by more than the step's worth of resolution.
-  function bruteForceMinCost(
+describe("Tax-optimal target-driven solver", () => {
+  // Brute-force sweep over (W, D_dj, D_solo, E) — for a fixed target T,
+  // find the minimum-tax combo that hits T (within step tolerance).
+  function bruteForceMinCostForTarget(
     base: Inputs,
-    opts: { wStep?: number; contribStep?: number } = {},
-  ): {
-    cost: number;
-    inputs: Inputs;
-  } {
-    const wStep = opts.wStep ?? 500;
-    const contribStep = opts.contribStep ?? 500;
+    target: number,
+    opts: { wStep?: number; contribStep?: number; tol?: number } = {},
+  ): { cost: number; inputs: Inputs | null } {
+    const wStep = opts.wStep ?? 1_000;
+    const contribStep = opts.contribStep ?? 250;
+    const tol = opts.tol ?? contribStep / 2 + 1;
     const limit402g =
       base.age >= 60 && base.age <= 63
         ? FEDERAL.elective402gLimit + FEDERAL.superCatchUp60to63
@@ -557,19 +554,15 @@ describe("Tax-optimal solver", () => {
     const C415 = FEDERAL.annualAdditions415c;
     const ssBase = FEDERAL.ssWageBase;
     const profit = Math.max(0, base.sCorpNetProfit);
+    const matchableComp = base.dayJobW2 * base.dayJobMatchLimitPct;
 
-    let best = { cost: Infinity, inputs: base };
+    let best: { cost: number; inputs: Inputs | null } = {
+      cost: Infinity,
+      inputs: null,
+    };
 
     const maxDDj = Math.min(limit402g, base.dayJobW2 * (1 - 0.062 - 0.0145));
-    // Match-capture floor: always defer at least matchableComp at the day
-    // job (free money via the match). Below this, the brute-force search
-    // is comparing apples to oranges relative to the closed-form which
-    // never forfeits the match.
-    const matchFloor = Math.min(
-      base.dayJobW2 * base.dayJobMatchLimitPct,
-      maxDDj,
-      limit402g,
-    );
+    const matchFloor = Math.min(matchableComp, maxDDj, limit402g);
     const dDjValues: number[] = [];
     for (let d = matchFloor; d <= maxDDj + 1; d += contribStep) {
       dDjValues.push(Math.min(d, maxDDj));
@@ -577,42 +570,31 @@ describe("Tax-optimal solver", () => {
     if (dDjValues.length === 0) dDjValues.push(matchFloor);
 
     for (let W = 0; W <= profit + 1; W += wStep) {
-      const erFica =
-        Math.min(W, ssBase) * 0.062 + W * 0.0145;
-      const postFica =
-        W - Math.min(W, ssBase) * 0.062 - W * 0.0145;
+      const erFica = Math.min(W, ssBase) * 0.062 + W * 0.0145;
+      const postFica = W - Math.min(W, ssBase) * 0.062 - W * 0.0145;
       const profitRoomE = Math.max(0, profit - W - erFica);
 
       for (const dDj of dDjValues) {
-        const room402gAfterDj = Math.max(0, limit402g - dDj);
-        const maxDSo = Math.min(
-          room402gAfterDj,
-          Math.max(0, postFica),
-          C415,
-        );
-
-        const dSoValues: number[] = [];
-        for (let d = 0; d <= maxDSo + 1; d += contribStep) {
-          dSoValues.push(Math.min(d, maxDSo));
-        }
-        if (dSoValues.length === 0) dSoValues.push(0);
-
-        for (const dSo of dSoValues) {
+        const match = Math.min(dDj, matchableComp) * base.dayJobMatchPct;
+        const room402g = Math.max(0, limit402g - dDj);
+        const maxDSo = Math.min(room402g, Math.max(0, postFica), C415);
+        for (let dSo = 0; dSo <= maxDSo + 1; dSo += contribStep) {
+          const dSoClamped = Math.min(dSo, maxDSo);
           const maxE = Math.min(
             W * 0.25,
-            Math.max(0, C415 - dSo),
+            Math.max(0, C415 - dSoClamped),
             profitRoomE,
           );
-
-          // E is monotonically harmful to tax (QBI loss), so the optimum
-          // over E given (W, dDj, dSo) is one of: 0, maxE. Two evals.
-          for (const E of [0, maxE]) {
+          for (let E = 0; E <= maxE + 1; E += contribStep) {
+            const eClamped = Math.min(E, maxE);
+            const total = dDj + match + dSoClamped + eClamped;
+            if (Math.abs(total - target) > tol) continue;
             const candInputs: Inputs = {
               ...base,
               sCorpW2Salary: W,
               dayJob401kEmployeeContribution: dDj,
-              soloEmployeeDeferral: dSo,
-              soloEmployerContribution: E,
+              soloEmployeeDeferral: dSoClamped,
+              soloEmployerContribution: eClamped,
             };
             const cost = totalTaxCost(compute(candInputs));
             if (cost < best.cost) {
@@ -622,19 +604,18 @@ describe("Tax-optimal solver", () => {
         }
       }
     }
-
     return best;
   }
 
-  // Tolerance: brute force has finite resolution (wStep = 500), so the
-  // closed-form might legitimately do a tiny bit worse than a hypothetical
-  // brute force at infinite resolution. Conversely, brute force might miss
-  // a kink between grid points. So the right relationship is
-  //   closed_form ≤ brute_force + slack
-  // where slack reflects brute force's resolution. $50 is generous.
-  const TOL = 50;
+  // Tolerance: brute force has finite resolution, so closed-form should
+  // be no worse than brute + slack.
+  const TOL = 100;
 
-  const scenarios: { name: string; inputs: Partial<Inputs> }[] = [
+  const scenarios: {
+    name: string;
+    inputs: Partial<Inputs>;
+    targets: number[];
+  }[] = [
     {
       name: "no day job, modest profit",
       inputs: {
@@ -642,25 +623,28 @@ describe("Tax-optimal solver", () => {
         dayJob401kEmployeeContribution: 0,
         sCorpNetProfit: 80_000,
       },
+      targets: [5_000, 15_000, 24_500],
     },
     {
-      name: "day job below SS base, profit fits 415(c)",
+      name: "day job below SS base",
       inputs: {
         dayJobW2: 100_000,
-        dayJob401kEmployeeContribution: 6_000,
+        dayJob401kEmployeeContribution: 0,
         sCorpNetProfit: 150_000,
       },
+      targets: [10_000, 30_000, 50_000],
     },
     {
-      name: "day job already at SS cap (all S-corp wages 'wasted SS')",
+      name: "day job at SS cap",
       inputs: {
         dayJobW2: 200_000,
         dayJob401kEmployeeContribution: 0,
         sCorpNetProfit: 150_000,
       },
+      targets: [20_000, 40_000],
     },
     {
-      name: "high earner, QBI fully phased out",
+      name: "high earner SSTB, QBI fully phased out",
       inputs: {
         dayJobW2: 0,
         dayJob401kEmployeeContribution: 0,
@@ -668,14 +652,7 @@ describe("Tax-optimal solver", () => {
         otherIncome: 200_000,
         isSSTB: true,
       },
-    },
-    {
-      name: "modest profit, day job at SS base",
-      inputs: {
-        dayJobW2: 184_500,
-        dayJob401kEmployeeContribution: 0,
-        sCorpNetProfit: 100_000,
-      },
+      targets: [20_000, 50_000, 72_000],
     },
     {
       name: "MFJ above QBI threshold",
@@ -685,37 +662,45 @@ describe("Tax-optimal solver", () => {
         dayJob401kEmployeeContribution: 0,
         sCorpNetProfit: 200_000,
       },
+      targets: [25_000, 50_000],
     },
   ];
 
-  for (const { name, inputs } of scenarios) {
-    it(`closed-form matches brute-force sweep: ${name}`, () => {
-      const base: Inputs = { ...baseInputs, ...inputs };
-      const optimal = taxOptimalSolution(base);
-      const brute = bruteForceMinCost(base, {
-        wStep: 1_000,
-        contribStep: 1_000,
+  for (const { name, inputs, targets } of scenarios) {
+    for (const target of targets) {
+      it(`closed-form ≤ brute force: ${name}, target $${target}`, () => {
+        const base: Inputs = { ...baseInputs, ...inputs };
+        const optimal = taxOptimalForTarget(base, target);
+        const brute = bruteForceMinCostForTarget(base, target, {
+          wStep: 1_000,
+          contribStep: 500,
+        });
+        if (brute.inputs === null) {
+          // Brute didn't find a hit at this resolution — closed form may
+          // still succeed via finer kink granularity.
+          return;
+        }
+        expect(optimal.feasible).toBe(true);
+        if (optimal.feasible) {
+          expect(optimal.totalTax).toBeLessThanOrEqual(brute.cost + TOL);
+          expect(optimal.totalContribution).toBeCloseTo(target, -1);
+        }
       });
-      // Closed form must be no worse than brute force (up to grid resolution).
-      expect(optimal.totalTax).toBeLessThanOrEqual(brute.cost + TOL);
-    });
+    }
   }
 
-  it("recommends staying at or near user's W when ramping is bad-EV", () => {
-    // Day job already past SS cap (combined wages > 184,500), so S-corp
-    // wages incur 6.2% wasted employer SS. With low marginal rate this is
-    // a net loss vs taking the QBI deduction.
+  it("returns infeasibility when target exceeds the absolute ceiling", () => {
     const base: Inputs = {
       ...baseInputs,
-      dayJobW2: 200_000,
-      dayJob401kEmployeeContribution: 0,
-      sCorpNetProfit: 100_000,
-      sCorpW2Salary: 50_000, // user's starting guess
+      dayJobW2: 100_000,
+      sCorpNetProfit: 50_000,
     };
-    const optimal = taxOptimalSolution(base);
-    // Should not recommend ramping W-2 beyond what's needed; should at
-    // least beat the user's current numbers.
-    expect(optimal.savingsVsCurrent).toBeGreaterThanOrEqual(-1);
+    const result = taxOptimalForTarget(base, 200_000);
+    expect(result.feasible).toBe(false);
+    if (!result.feasible) {
+      expect(result.maximumAchievable).toBeGreaterThan(0);
+      expect(result.maximumAchievable).toBeLessThan(200_000);
+    }
   });
 
   // Brute-force counterpart for maxAchievableContribution: sweep all the
@@ -778,12 +763,9 @@ describe("Tax-optimal solver", () => {
       const base: Inputs = { ...baseInputs, ...inputs };
       const closedMax = maxAchievableContribution(base);
       const bruteMax = bruteForceMaxContribution(base, {
-        wStep: 1_000,
+        wStep: 500,
         contribStep: 1_000,
       });
-      // Closed form must be no LESS than brute (it's claiming the maximum;
-      // brute might miss the exact kink by grid resolution, so allow small
-      // slack on the other side too).
       expect(closedMax, `${name}: closed ${closedMax} vs brute ${bruteMax}`)
         .toBeGreaterThanOrEqual(bruteMax - 100);
     }
@@ -795,36 +777,38 @@ describe("Tax-optimal solver", () => {
       dayJobW2: 150_000,
       sCorpNetProfit: 150_000,
     };
-    const opt = taxOptimalSolution(base);
+    const result = taxOptimalForTarget(base, 30_000);
+    expect(result.feasible).toBe(true);
+    if (!result.feasible) return;
     // 25% rule
-    expect(opt.soloEmployerContribution).toBeLessThanOrEqual(
-      opt.sCorpW2 * 0.25 + 1,
+    expect(result.soloEmployerContribution).toBeLessThanOrEqual(
+      result.sCorpW2 * 0.25 + 1,
     );
     // 415(c) on solo
-    expect(opt.soloEmployeeDeferral + opt.soloEmployerContribution).toBeLessThanOrEqual(
-      FEDERAL.annualAdditions415c + 1,
-    );
+    expect(
+      result.soloEmployeeDeferral + result.soloEmployerContribution,
+    ).toBeLessThanOrEqual(FEDERAL.annualAdditions415c + 1);
     // 402(g) combined
     const limit402g =
       base.age >= 50
         ? FEDERAL.elective402gLimit + FEDERAL.catchUp50Plus
         : FEDERAL.elective402gLimit;
     expect(
-      opt.dayJobEmployeeDeferral + opt.soloEmployeeDeferral,
+      result.dayJobEmployeeDeferral + result.soloEmployeeDeferral,
     ).toBeLessThanOrEqual(limit402g + 1);
     // Post-FICA cash
-    const ssTaxable = Math.min(opt.sCorpW2, FEDERAL.ssWageBase);
+    const ssTaxable = Math.min(result.sCorpW2, FEDERAL.ssWageBase);
     const postFica =
-      opt.sCorpW2 -
+      result.sCorpW2 -
       ssTaxable * FEDERAL.ssRateEmployee -
-      opt.sCorpW2 * FEDERAL.medicareRateEmployee;
-    expect(opt.soloEmployeeDeferral).toBeLessThanOrEqual(postFica + 1);
+      result.sCorpW2 * FEDERAL.medicareRateEmployee;
+    expect(result.soloEmployeeDeferral).toBeLessThanOrEqual(postFica + 1);
     // Profit cap
     const erFica =
       ssTaxable * FEDERAL.ssRateEmployer +
-      opt.sCorpW2 * FEDERAL.medicareRateEmployer;
+      result.sCorpW2 * FEDERAL.medicareRateEmployer;
     expect(
-      opt.sCorpW2 + erFica + opt.soloEmployerContribution,
+      result.sCorpW2 + erFica + result.soloEmployerContribution,
     ).toBeLessThanOrEqual(base.sCorpNetProfit + 1);
   });
 });

@@ -2,11 +2,8 @@ import type { TaxOptimalSolution } from "../lib/solver";
 import { money } from "../lib/format";
 
 /**
- * Headline recommendation: the (sCorpW-2, deferral, employer) combination
- * that minimizes total tax + non-recoverable FICA this year. Different
- * from maxAchievableContribution in that it values current-year cash
- * (after FICA + income tax) over additional 401(k) dollars when the
- * ramp would cost more in payroll tax than it saves in deferrals.
+ * Given a target contribution, the cheapest (W, D_dj, D_so, E) tuple that
+ * hits the target. Two render branches: feasible vs infeasible.
  */
 export function TaxOptimalCard({
   solution,
@@ -15,12 +12,33 @@ export function TaxOptimalCard({
   solution: TaxOptimalSolution;
   onApply: () => void;
 }) {
+  if (!solution.feasible) {
+    return (
+      <div className="mt-3 border-l-2 border-warn pl-4 py-1">
+        <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-warn mb-2">
+          Out of reach
+        </div>
+        <p className="text-sm leading-relaxed text-ink-soft mb-2">
+          {solution.reason}
+        </p>
+        <div className="text-sm">
+          <span className="text-[10px] uppercase tracking-[0.14em] text-ink-faint">
+            Maximum reachable
+          </span>
+          <span className="ml-2 font-mono tabular-nums text-ink">
+            {money(solution.maximumAchievable)}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
   const savesMoney = solution.savingsVsCurrent > 1;
   return (
     <div className="mt-3 border-l-2 border-accent pl-4 py-1">
       <div className="flex items-baseline justify-between mb-2">
         <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-accent">
-          Tax-optimal split
+          Cheapest path to your target
         </div>
         {savesMoney && (
           <div className="font-mono text-[10px] text-positive tabular-nums">
