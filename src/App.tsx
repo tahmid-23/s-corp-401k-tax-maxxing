@@ -1,7 +1,11 @@
 import { useMemo, useState } from "react";
 import { motion } from "motion/react";
 import { compute, type Inputs } from "./lib/calc";
-import { maxAchievableContribution, solveForTarget } from "./lib/solver";
+import {
+  maxAchievableContribution,
+  solveForTarget,
+  taxOptimalSolution,
+} from "./lib/solver";
 import {
   FEDERAL,
   STATES,
@@ -19,6 +23,7 @@ import { LimitBar } from "./components/LimitBar";
 import { DiagnosticRow } from "./components/DiagnosticRow";
 import { Explainer } from "./components/Explainer";
 import { SolverCard } from "./components/SolverCard";
+import { TaxOptimalCard } from "./components/TaxOptimalCard";
 
 const DEFAULT_INPUTS: Inputs = {
   filingStatus: "single",
@@ -49,6 +54,18 @@ export function App() {
     () => maxAchievableContribution(inputs),
     [inputs],
   );
+  const optimal = useMemo(() => taxOptimalSolution(inputs), [inputs]);
+
+  const applyOptimal = () => {
+    setInputs((p) => ({
+      ...p,
+      sCorpW2Salary: Math.round(optimal.sCorpW2),
+      dayJob401kEmployeeContribution: Math.round(optimal.dayJobEmployeeDeferral),
+      soloEmployeeDeferral: Math.round(optimal.soloEmployeeDeferral),
+      soloEmployerContribution: Math.round(optimal.soloEmployerContribution),
+    }));
+  };
+
   const solution = useMemo(
     () =>
       target401k != null && target401k > 0
@@ -330,18 +347,19 @@ export function App() {
                   step={5_000}
                 />
               </Field>
-              <div className="flex items-baseline justify-between text-sm pt-1">
-                <span className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">
-                  Max possible with these inputs
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setTarget401k(Math.floor(maxContribution))}
-                  className="font-mono tabular-nums text-base text-accent underline decoration-accent/30 underline-offset-2 hover:decoration-accent transition-colors"
-                  title="Click to set target to this amount"
-                >
+              <TaxOptimalCard solution={optimal} onApply={applyOptimal} />
+              <div className="flex items-baseline justify-between text-sm pt-3 mt-3 border-t border-rule-soft">
+                <div>
+                  <div className="text-[11px] uppercase tracking-[0.14em] text-ink-faint">
+                    Absolute ceiling
+                  </div>
+                  <div className="text-[11px] text-ink-faint italic mt-0.5">
+                    What you could cram into 401(k) ignoring tax cost
+                  </div>
+                </div>
+                <span className="font-mono tabular-nums text-base text-ink">
                   {money(Math.floor(maxContribution))}
-                </button>
+                </span>
               </div>
               <Field
                 label="Target 401(k) total (optional)"
